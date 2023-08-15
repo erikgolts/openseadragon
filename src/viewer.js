@@ -3454,10 +3454,10 @@ function onCanvasPinch( event ) {
                 if( !this.panVertical ) {
                     panByPt.y = 0;
                 }
-                this.viewport.panBy(panByPt, false);
+                this.viewport.panBy(panByPt, gestureSettings.animatePinchToZoom);
             }
             if ( !canvasPinchEventArgs.preventDefaultZoomAction ) {
-                this.viewport.zoomBy( event.distance / event.lastDistance, centerPt, false );
+                this.viewport.zoomBy( event.distance / event.lastDistance, centerPt, gestureSettings.animatePinchToZoom );
             }
             this.viewport.applyConstraints();
         }
