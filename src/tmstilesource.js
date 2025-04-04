@@ -2,7 +2,7 @@
  * OpenSeadragon - TmsTileSource
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -131,6 +131,13 @@ $.extend( $.TmsTileSource.prototype, $.TileSource.prototype, /** @lends OpenSead
         var yTiles = this.getNumTiles( level ).y - 1;
 
         return this.tilesUrl + level + "/" + x + "/" + (yTiles - y) + ".png";
+    },
+
+    /**
+     * Equality comparator
+     */
+    equals: function (otherSource) {
+        return this.tilesUrl === otherSource.tilesUrl;
     }
 });
 

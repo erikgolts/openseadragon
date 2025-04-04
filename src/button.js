@@ -2,7 +2,7 @@
  * OpenSeadragon - Button
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -166,13 +166,6 @@ $.Button = function( options ) {
         this.imgHover.style.visibility =
         this.imgDown.style.visibility  =
             "hidden";
-
-        if ($.Browser.vendor === $.BROWSERS.FIREFOX && $.Browser.version < 3) {
-            this.imgGroup.style.top =
-            this.imgHover.style.top =
-            this.imgDown.style.top  =
-                "";
-        }
 
         this.element.appendChild( this.imgRest );
         this.element.appendChild( this.imgGroup );

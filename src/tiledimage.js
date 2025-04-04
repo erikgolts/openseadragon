@@ -2,7 +2,7 @@
  * OpenSeadragon - TiledImage
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -72,8 +72,8 @@
  * @param {Boolean} [options.iOSDevice] - See {@link OpenSeadragon.Options}.
  * @param {Number} [options.opacity=1] - Set to draw at proportional opacity. If zero, images will not draw.
  * @param {Boolean} [options.preload=false] - Set true to load even when the image is hidden by zero opacity.
- * @param {String} [options.compositeOperation] - How the image is composited onto other images; see compositeOperation in {@link OpenSeadragon.Options} for possible
- values.
+ * @param {String} [options.compositeOperation] - How the image is composited onto other images;
+ * see compositeOperation in {@link OpenSeadragon.Options} for possible values.
  * @param {Boolean} [options.debugMode] - See {@link OpenSeadragon.Options}.
  * @param {String|CanvasGradient|CanvasPattern|Function} [options.placeholderFillStyle] - See {@link OpenSeadragon.Options}.
  * @param {String|Boolean} [options.crossOriginPolicy] - See {@link OpenSeadragon.Options}.
@@ -85,7 +85,7 @@
  *      A set of headers to include when making tile AJAX requests.
  */
 $.TiledImage = function( options ) {
-    var _this = this;
+    this._initialized = false;
     /**
      * The {@link OpenSeadragon.TileSource} that defines this TiledImage.
      * @member {OpenSeadragon.TileSource} source
@@ -159,10 +159,16 @@ $.TiledImage = function( options ) {
         loadingCoverage: {},   // A '3d' dictionary [level][x][y] --> Boolean; shows what areas are loaded or are being loaded/blended.
         lastDrawn:      [],    // An unordered list of Tiles drawn last frame.
         lastResetTime:  0,     // Last time for which the tiledImage was reset.
-        _midDraw:       false, // Is the tiledImage currently updating the viewport?
-        _needsDraw:     true,  // Does the tiledImage need to update the viewport again?
+        _needsDraw:     true,  // Does the tiledImage need to be drawn again?
+        _needsUpdate:   true,  // Does the tiledImage need to update the viewport again?
         _hasOpaqueTile: false,  // Do we have even one fully opaque tile?
         _tilesLoading:  0,     // The number of pending tile requests.
+        _zombieCache:   false, // Allow cache to stay in memory upon deletion.
+        _tilesToDraw:   [],    // info about the tiles currently in the viewport, two deep: array[level][tile]
+        _lastDrawn:     [],    // array of tiles that were last fetched by the drawer
+        _isBlending:    false, // Are any tiles still being blended?
+        _wasBlending:   false, // Were any tiles blending before the last draw?
+        _isTainted:     false, // Has a Tile been found with tainted data?
         //configurable settings
         springStiffness:                   $.DEFAULT_SETTINGS.springStiffness,
         animationTime:                     $.DEFAULT_SETTINGS.animationTime,
@@ -170,6 +176,7 @@ $.TiledImage = function( options ) {
         wrapHorizontal:                    $.DEFAULT_SETTINGS.wrapHorizontal,
         wrapVertical:                      $.DEFAULT_SETTINGS.wrapVertical,
         immediateRender:                   $.DEFAULT_SETTINGS.immediateRender,
+        loadDestinationTilesOnAnimation:   $.DEFAULT_SETTINGS.loadDestinationTilesOnAnimation,
         blendTime:                         $.DEFAULT_SETTINGS.blendTime,
         alwaysBlend:                       $.DEFAULT_SETTINGS.alwaysBlend,
         minPixelRatio:                     $.DEFAULT_SETTINGS.minPixelRatio,
@@ -183,7 +190,8 @@ $.TiledImage = function( options ) {
         preload:                           $.DEFAULT_SETTINGS.preload,
         compositeOperation:                $.DEFAULT_SETTINGS.compositeOperation,
         subPixelRoundingForTransparency:   $.DEFAULT_SETTINGS.subPixelRoundingForTransparency,
-        maxTilesPerFrame:                  $.DEFAULT_SETTINGS.maxTilesPerFrame
+        maxTilesPerFrame:                  $.DEFAULT_SETTINGS.maxTilesPerFrame,
+        _currentMaxTilesPerFrame:          (options.maxTilesPerFrame || $.DEFAULT_SETTINGS.maxTilesPerFrame) * 10
     }, options );
 
     this._preload = this.preload;
@@ -221,30 +229,10 @@ $.TiledImage = function( options ) {
         this.fitBounds(fitBounds, fitBoundsPlacement, true);
     }
 
-    // We need a callback to give image manipulation a chance to happen
-    this._drawingHandler = function(args) {
-        /**
-         * This event is fired just before the tile is drawn giving the application a chance to alter the image.
-         *
-         * NOTE: This event is only fired when the drawer is using a &lt;canvas&gt;.
-         *
-         * @event tile-drawing
-         * @memberof OpenSeadragon.Viewer
-         * @type {object}
-         * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
-         * @property {OpenSeadragon.Tile} tile - The Tile being drawn.
-         * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
-         * @property {OpenSeadragon.Tile} context - The HTML canvas context being drawn into.
-         * @property {OpenSeadragon.Tile} rendered - The HTML canvas context containing the tile imagery.
-         * @property {?Object} userData - Arbitrary subscriber-defined object.
-         */
-        _this.viewer.raiseEvent('tile-drawing', $.extend({
-            tiledImage: _this
-        }, args));
-    };
-
     this._ownAjaxHeaders = {};
     this.setAjaxHeaders(ajaxHeaders, false);
+    this._initialized = true;
+    // this.invalidatedAt = 0;
 };
 
 $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadragon.TiledImage.prototype */{
@@ -253,6 +241,13 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      */
     needsDraw: function() {
         return this._needsDraw;
+    },
+
+    /**
+     * Mark the tiled image as needing to be (re)drawn
+     */
+    redraw: function() {
+        this._needsDraw = true;
     },
 
     /**
@@ -287,27 +282,55 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
+     * Forces the system consider all tiles in this tiled image
+     * as outdated, and fire tile update event on relevant tiles
+     * Detailed description is available within the 'tile-invalidated'
+     * event.
+     * @param {Boolean} [restoreTiles=true] if true, tile processing starts from the tile original data
+     * @param {boolean} [viewportOnly=false] optionally invalidate only viewport-visible tiles if true
+     * @param {number} [tStamp=OpenSeadragon.now()] optionally provide tStamp of the update event
+     */
+    requestInvalidate: function (restoreTiles = true, viewportOnly = false, tStamp = $.now()) {
+        const tiles = viewportOnly ? this._lastDrawn.map(x => x.tile) : this._tileCache.getLoadedTilesFor(this);
+        return this.viewer.world.requestTileInvalidateEvent(tiles, tStamp, restoreTiles);
+    },
+
+    /**
      * Clears all tiles and triggers an update on the next call to
      * {@link OpenSeadragon.TiledImage#update}.
      */
     reset: function() {
         this._tileCache.clearTilesFor(this);
+        this._currentMaxTilesPerFrame = this.maxTilesPerFrame * 10;
         this.lastResetTime = $.now();
         this._needsDraw = true;
+        this._fullyLoaded = false;
     },
 
     /**
-     * Updates the TiledImage's bounds, animating if needed.
-     * @returns {Boolean} Whether the TiledImage animated.
+     * Updates the TiledImage's bounds, animating if needed. Based on the new
+     * bounds, updates the levels and tiles to be drawn into the viewport.
+     * @param viewportChanged Whether the viewport changed meaning tiles need to be updated.
+     * @returns {Boolean} Whether the TiledImage needs to be drawn.
      */
-    update: function() {
-        var xUpdated = this._xSpring.update();
-        var yUpdated = this._ySpring.update();
-        var scaleUpdated = this._scaleSpring.update();
-        var degreesUpdated = this._degreesSpring.update();
+    update: function(viewportChanged) {
+        let xUpdated = this._xSpring.update();
+        let yUpdated = this._ySpring.update();
+        let scaleUpdated = this._scaleSpring.update();
+        let degreesUpdated = this._degreesSpring.update();
 
-        if (xUpdated || yUpdated || scaleUpdated || degreesUpdated) {
+        let updated = (xUpdated || yUpdated || scaleUpdated || degreesUpdated || this._needsUpdate);
+
+        if (updated || viewportChanged || !this._fullyLoaded){
+            let fullyLoadedFlag = this._updateLevelsForViewport();
+            this._setFullyLoaded(fullyLoadedFlag);
+        }
+
+        this._needsUpdate = false;
+
+        if (updated) {
             this._updateForScale();
+            this._raiseBoundsChange();
             this._needsDraw = true;
             return true;
         }
@@ -316,18 +339,34 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * Draws the TiledImage to its Drawer.
+     * Mark this TiledImage as having been drawn, so that it will only be drawn
+     * again if something changes about the image. If the image is still blending,
+     * this will have no effect.
+     * @returns {Boolean} whether the item still needs to be drawn due to blending
      */
-    draw: function() {
-        if (this.opacity !== 0 || this._preload) {
-            this._midDraw = true;
-            this._updateViewport();
-            this._midDraw = false;
-        }
-        // Images with opacity 0 should not need to be drawn in future. this._needsDraw = false is set in this._updateViewport() for other images.
-        else {
-            this._needsDraw = false;
-        }
+    setDrawn: function(){
+        this._needsDraw = this._isBlending || this._wasBlending ||
+            (this.opacity > 0 && this._lastDrawn.length < 1);
+        return this._needsDraw;
+    },
+
+    /**
+     * Set the internal _isTainted flag for this TiledImage. Lazy loaded - not
+     * checked each time a Tile is loaded, but can be set if a consumer of the
+     * tiles (e.g. a Drawer) discovers a Tile to have tainted data so that further
+     * checks are not needed and alternative rendering strategies can be used.
+     * @private
+     */
+    setTainted(isTainted){
+        this._isTainted = isTainted;
+    },
+
+    /**
+     * @private
+     * @returns {Boolean} whether the TiledImage has been marked as tainted
+     */
+    isTainted(){
+        return this._isTainted;
     },
 
     /**
@@ -335,10 +374,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      */
     destroy: function() {
         this.reset();
-
-        if (this.source.destroy) {
-            this.source.destroy();
-        }
+        this.source.destroy(this.viewer);
     },
 
     /**
@@ -414,7 +450,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
         var yMod    = ( numTiles.y + ( y % numTiles.y ) ) % numTiles.y;
         var bounds = this.source.getTileBounds(level, xMod, yMod);
         if (this.getFlip()) {
-            bounds.x = 1 - bounds.x - bounds.width;
+            bounds.x = Math.max(0, 1 - bounds.x - bounds.width);
         }
         bounds.x += (x - xMod) / numTiles.x;
         bounds.y += (this._worldHeightCurrent / this._worldWidthCurrent) * ((y - yMod) / numTiles.y);
@@ -495,7 +531,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             imageX = imageX.x;
         }
 
-        var point = this._imageToViewportDelta(imageX, imageY);
+        var point = this._imageToViewportDelta(imageX, imageY, current);
         if (current) {
             point.x += this._xSpring.current.value;
             point.y += this._ySpring.current.value;
@@ -681,6 +717,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._xSpring.resetTo(position.x);
             this._ySpring.resetTo(position.y);
             this._needsDraw = true;
+            this._needsUpdate = true;
         } else {
             if (sameTarget) {
                 return;
@@ -689,6 +726,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._xSpring.springTo(position.x);
             this._ySpring.springTo(position.y);
             this._needsDraw = true;
+            this._needsUpdate = true;
         }
 
         if (!sameTarget) {
@@ -727,7 +765,6 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      * ]
      */
     setCroppingPolygons: function( polygons ) {
-
         var isXYObject = function(obj) {
             return obj instanceof $.Point || (typeof obj.x === 'number' && typeof obj.y === 'number');
         };
@@ -753,10 +790,11 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._croppingPolygons = polygons.map(function(polygon){
                 return objectToSimpleXYObject(polygon);
             });
+            this._needsDraw = true;
         } catch (e) {
             $.console.error('[TiledImage.setCroppingPolygons] Cropping polygon format not supported');
             $.console.error(e);
-            this._croppingPolygons = null;
+            this.resetCroppingPolygons();
         }
     },
 
@@ -766,6 +804,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      */
     resetCroppingPolygons: function() {
         this._croppingPolygons = null;
+        this._needsDraw = true;
     },
 
     /**
@@ -857,6 +896,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._clip = null;
         }
 
+        this._needsUpdate = true;
         this._needsDraw = true;
         /**
          * Raised when the TiledImage's clip is changed.
@@ -874,7 +914,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      * @returns {Boolean} Whether the TiledImage should be flipped before rendering.
      */
     getFlip: function() {
-        return !!this.flipped;
+        return this.flipped;
     },
 
     /**
@@ -882,9 +922,54 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      * @fires OpenSeadragon.TiledImage.event:bounds-change
      */
     setFlip: function(flip) {
-        this.flipped = !!flip;
+        this.flipped = flip;
+    },
+
+    get flipped() {
+        return this._flipped;
+    },
+    set flipped(flipped) {
+        let changed = this._flipped !== !!flipped;
+        this._flipped = !!flipped;
+        if (changed && this._initialized) {
+            this.update(true);
+            this._needsDraw = true;
+            this._raiseBoundsChange();
+        }
+    },
+
+    get wrapHorizontal(){
+        return this._wrapHorizontal;
+    },
+    set wrapHorizontal(wrap){
+        let changed = this._wrapHorizontal !== !!wrap;
+        this._wrapHorizontal = !!wrap;
+        if(this._initialized && changed){
+            this.update(true);
+            this._needsDraw = true;
+            // this._raiseBoundsChange();
+        }
+    },
+
+    get wrapVertical(){
+        return this._wrapVertical;
+    },
+    set wrapVertical(wrap){
+        let changed = this._wrapVertical !== !!wrap;
+        this._wrapVertical = !!wrap;
+        if(this._initialized && changed){
+            this.update(true);
+            this._needsDraw = true;
+            // this._raiseBoundsChange();
+        }
+    },
+
+    get debugMode(){
+        return this._debugMode;
+    },
+    set debugMode(debug){
+        this._debugMode = !!debug;
         this._needsDraw = true;
-        this._raiseBoundsChange();
     },
 
     /**
@@ -899,12 +984,21 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      * @fires OpenSeadragon.TiledImage.event:opacity-change
      */
     setOpacity: function(opacity) {
+        this.opacity = opacity;
+    },
+
+    get opacity() {
+        return this._opacity;
+    },
+
+    set opacity(opacity) {
         if (opacity === this.opacity) {
             return;
         }
 
-        this.opacity = opacity;
+        this._opacity = opacity;
         this._needsDraw = true;
+        this._needsUpdate = true;
         /**
          * Raised when the TiledImage's opacity is changed.
          * @event opacity-change
@@ -964,7 +1058,69 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._degreesSpring.springTo(degrees);
         }
         this._needsDraw = true;
+        this._needsUpdate = true;
         this._raiseBoundsChange();
+    },
+
+    /**
+     * Get the region of this tiled image that falls within the viewport.
+     * @returns {OpenSeadragon.Rect} the region of this tiled image that falls within the viewport.
+     * Returns false for images with opacity==0 unless preload==true
+     */
+    getDrawArea: function(){
+
+        if( this._opacity === 0 && !this._preload){
+            return false;
+        }
+
+        var drawArea = this._viewportToTiledImageRectangle(
+            this.viewport.getBoundsWithMargins(true));
+
+        if (!this.wrapHorizontal && !this.wrapVertical) {
+            var tiledImageBounds = this._viewportToTiledImageRectangle(
+                this.getClippedBounds(true));
+            drawArea = drawArea.intersection(tiledImageBounds);
+        }
+
+        return drawArea;
+    },
+
+    getLoadArea: function() {
+        var loadArea = this._viewportToTiledImageRectangle(
+            this.viewport.getBoundsWithMargins(false));
+
+        if (!this.wrapHorizontal && !this.wrapVertical) {
+            var tiledImageBounds = this._viewportToTiledImageRectangle(
+            this.getClippedBounds(false));
+            loadArea = loadArea.intersection(tiledImageBounds);
+        }
+
+        return loadArea;
+    },
+
+    /**
+     *
+     * @returns {Array} Array of Tiles that make up the current view
+     */
+    getTilesToDraw: function(){
+        // start with all the tiles added to this._tilesToDraw during the most recent
+        // call to this.update. Then update them so the blending and coverage properties
+        // are updated based on the current time
+        let tileArray = this._tilesToDraw.flat();
+
+        // update all tiles, which can change the coverage provided
+        this._updateTilesInViewport(tileArray);
+
+        // _tilesToDraw might have been updated by the update; refresh it
+        tileArray = this._tilesToDraw.flat();
+
+        // mark the tiles as being drawn, so that they won't be discarded from
+        // the tileCache
+        tileArray.forEach(tileInfo => {
+            tileInfo.tile.beingDrawn = true;
+        });
+        this._lastDrawn = tileArray;
+        return tileArray;
     },
 
     /**
@@ -977,23 +1133,16 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
         return this.getBoundsNoRotate(current).getCenter();
     },
 
-    /**
-     * @returns {String} The TiledImage's current compositeOperation.
-     */
-    getCompositeOperation: function() {
-        return this.compositeOperation;
+    get compositeOperation(){
+        return this._compositeOperation;
     },
 
-    /**
-     * @param {String} compositeOperation the tiled image should be drawn with this globalCompositeOperation.
-     * @fires OpenSeadragon.TiledImage.event:composite-operation-change
-     */
-    setCompositeOperation: function(compositeOperation) {
-        if (compositeOperation === this.compositeOperation) {
+    set compositeOperation(compositeOperation){
+
+        if (compositeOperation === this._compositeOperation) {
             return;
         }
-
-        this.compositeOperation = compositeOperation;
+        this._compositeOperation = compositeOperation;
         this._needsDraw = true;
         /**
          * Raised when the TiledImage's opacity is changed.
@@ -1006,8 +1155,24 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
          * @property {?Object} userData - Arbitrary subscriber-defined object.
          */
         this.raiseEvent('composite-operation-change', {
-            compositeOperation: this.compositeOperation
+            compositeOperation: this._compositeOperation
         });
+
+    },
+
+    /**
+     * @returns {String} The TiledImage's current compositeOperation.
+     */
+    getCompositeOperation: function() {
+        return this._compositeOperation;
+    },
+
+    /**
+     * @param {String} compositeOperation the tiled image should be drawn with this globalCompositeOperation.
+     * @fires OpenSeadragon.TiledImage.event:composite-operation-change
+     */
+    setCompositeOperation: function(compositeOperation) {
+        this.compositeOperation = compositeOperation; //invokes setter
     },
 
     /**
@@ -1029,7 +1194,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             ajaxHeaders = {};
         }
         if (!$.isPlainObject(ajaxHeaders)) {
-            console.error('[TiledImage.setAjaxHeaders] Ignoring invalid headers, must be a plain object');
+            $.console.error('[TiledImage.setAjaxHeaders] Ignoring invalid headers, must be a plain object');
             return;
         }
 
@@ -1094,6 +1259,18 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
         }
     },
 
+    /**
+     * Enable cache preservation even without this tile image,
+     * by default disabled. It means that upon removing,
+     * the tile cache does not get immediately erased but
+     * stays in the memory to be potentially re-used by other
+     * TiledImages.
+     * @param {boolean} allow
+     */
+    allowZombieCache: function(allow) {
+        this._zombieCache = allow;
+    },
+
     // private
     _setScale: function(scale, immediately) {
         var sameTarget = (this._scaleSpring.target.value === scale);
@@ -1105,6 +1282,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._scaleSpring.resetTo(scale);
             this._updateForScale();
             this._needsDraw = true;
+            this._needsUpdate = true;
         } else {
             if (sameTarget) {
                 return;
@@ -1113,6 +1291,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             this._scaleSpring.springTo(scale);
             this._updateForScale();
             this._needsDraw = true;
+            this._needsUpdate = true;
         }
 
         if (!sameTarget) {
@@ -1175,69 +1354,84 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
         };
     },
 
-    /**
-     * @private
-     * @inner
-     * Pretty much every other line in this needs to be documented so it's clear
-     * how each piece of this routine contributes to the drawing process.  That's
-     * why there are so many TODO's inside this function.
-     */
-    _updateViewport: function() {
-        this._needsDraw = false;
+    // returns boolean flag of whether the image should be marked as fully loaded
+    _updateLevelsForViewport: function(){
+        var levelsInterval = this._getLevelsInterval();
+        var lowestLevel = levelsInterval.lowestLevel; // the lowest level we should draw at our current zoom
+        var highestLevel = levelsInterval.highestLevel; // the highest level we should draw at our current zoom
+        var bestTiles = [];
+        var drawArea = this.getDrawArea();
+        var loadArea = drawArea;
+
+        if (this.loadDestinationTilesOnAnimation) {
+          loadArea = this.getLoadArea();
+        }
+        var currentTime = $.now();
+
+        // reset each tile's beingDrawn flag
+        this._lastDrawn.forEach(tileinfo => {
+            tileinfo.tile.beingDrawn = false;
+        });
+        // clear the list of tiles to draw
+        this._tilesToDraw = [];
         this._tilesLoading = 0;
         this.loadingCoverage = {};
 
-        // Reset tile's internal drawn state
-        while (this.lastDrawn.length > 0) {
-            var tile = this.lastDrawn.pop();
-            tile.beingDrawn = false;
+        if(!drawArea){
+            this._needsDraw = false;
+            return this._fullyLoaded;
         }
 
-        var viewport = this.viewport;
-        var drawArea = this._viewportToTiledImageRectangle(
-            viewport.getBoundsWithMargins(true));
+        // make a list of levels to use for the current zoom level
+        var levelList = new Array(highestLevel - lowestLevel + 1);
+        // go from highest to lowest resolution
+        for(let i = 0, level = highestLevel; level >= lowestLevel; level--, i++){
+            levelList[i] = level;
+        }
 
-        if (!this.wrapHorizontal && !this.wrapVertical) {
-            var tiledImageBounds = this._viewportToTiledImageRectangle(
-                this.getClippedBounds(true));
-            drawArea = drawArea.intersection(tiledImageBounds);
-            if (drawArea === null) {
-                return;
+        // if a single-tile level is loaded, add that to the end of the list
+        // as a fallback to use during zooming out, until a lower-res tile is
+        // loaded
+        for(let level = highestLevel + 1; level <= this.source.maxLevel; level++){
+            var tile = (
+                this.tilesMatrix[level] &&
+                this.tilesMatrix[level][0] &&
+                this.tilesMatrix[level][0][0]
+            );
+            if(tile && tile.isBottomMost && tile.isRightMost && tile.loaded){
+                levelList.push(level);
+                break;
             }
         }
 
-        var levelsInterval = this._getLevelsInterval();
-        var lowestLevel = levelsInterval.lowestLevel;
-        var highestLevel = levelsInterval.highestLevel;
-        var bestTiles = [];
-        var haveDrawn = false;
-        var currentTime = $.now();
 
-        // Update any level that will be drawn
-        for (var level = highestLevel; level >= lowestLevel; level--) {
-            var drawLevel = false;
+        // Update any level that will be drawn.
+        // We are iterating from highest resolution to lowest resolution
+        // Once a level fully covers the viewport the loop is halted and
+        // lower-resolution levels are skipped
+        let useLevel = false;
+        for (let i = 0; i < levelList.length; i++) {
+            let level = levelList[i];
 
-            //Avoid calculations for draw if we have already drawn this
-            var currentRenderPixelRatio = viewport.deltaPixelsFromPointsNoRotate(
+            var currentRenderPixelRatio = this.viewport.deltaPixelsFromPointsNoRotate(
                 this.source.getPixelRatio(level),
                 true
             ).x * this._scaleSpring.current.value;
 
-            if (level === lowestLevel ||
-                (!haveDrawn && currentRenderPixelRatio >= this.minPixelRatio)) {
-                drawLevel = true;
-                haveDrawn = true;
-            } else if (!haveDrawn) {
+            // make sure we skip levels until currentRenderPixelRatio becomes >= minPixelRatio
+            // but always use the last level in the list so we draw something
+            if (i === levelList.length - 1 || currentRenderPixelRatio >= this.minPixelRatio ) {
+                useLevel = true;
+            } else if (!useLevel) {
                 continue;
             }
 
-            //Perform calculations for draw if we haven't drawn this
-            var targetRenderPixelRatio = viewport.deltaPixelsFromPointsNoRotate(
+            var targetRenderPixelRatio = this.viewport.deltaPixelsFromPointsNoRotate(
                 this.source.getPixelRatio(level),
                 false
             ).x * this._scaleSpring.current.value;
 
-            var targetZeroRatio = viewport.deltaPixelsFromPointsNoRotate(
+            var targetZeroRatio = this.viewport.deltaPixelsFromPointsNoRotate(
                 this.source.getPixelRatio(
                     Math.max(
                         this.source.getClosestLevel(),
@@ -1253,17 +1447,31 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
                 optimalRatio - targetRenderPixelRatio
             );
 
-            // Update the level and keep track of 'best' tile to load
-            bestTiles = this._updateLevel(
-                haveDrawn,
-                drawLevel,
+            // Update the level and keep track of 'best' tiles to load
+            var result = this._updateLevel(
                 level,
                 levelOpacity,
                 levelVisibility,
                 drawArea,
+                loadArea,
                 currentTime,
                 bestTiles
             );
+
+            bestTiles = result.bestTiles;
+            var tiles = result.updatedTiles.filter(tile => tile.loaded);
+            var makeTileInfoObject = (function(level, levelOpacity, currentTime){
+                return function(tile){
+                    return {
+                        tile: tile,
+                        level: level,
+                        levelOpacity: levelOpacity,
+                        currentTime: currentTime
+                    };
+                };
+            })(level, levelOpacity, currentTime);
+
+            this._tilesToDraw[level] = tiles.map(makeTileInfoObject);
 
             // Stop the loop if lower-res tiles would all be covered by
             // already drawn tiles
@@ -1272,21 +1480,470 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             }
         }
 
-        // Perform the actual drawing
-        this._drawTiles(this.lastDrawn);
 
         // Load the new 'best' n tiles
         if (bestTiles && bestTiles.length > 0) {
-            bestTiles.forEach(function (tile) {
-                if (tile && !tile.context2D) {
+            for (let tile of bestTiles) {
+                if (tile) {
                     this._loadTile(tile, currentTime);
                 }
-            }, this);
+            }
             this._needsDraw = true;
-            this._setFullyLoaded(false);
+            return false;
         } else {
-            this._setFullyLoaded(this._tilesLoading === 0);
+            return this._tilesLoading === 0;
         }
+    },
+
+    /**
+     * Update all tiles that contribute to the current view
+     * @private
+     *
+     */
+    _updateTilesInViewport: function(tiles) {
+        let currentTime = $.now();
+        let _this = this;
+        this._tilesLoading = 0;
+        this._wasBlending = this._isBlending;
+        this._isBlending = false;
+        this.loadingCoverage = {};
+        let lowestLevel = tiles.length ? tiles[0].level : 0;
+
+        let drawArea = this.getDrawArea();
+        if(!drawArea){
+            return;
+        }
+
+        function updateTile(info){
+            let tile = info.tile;
+            if(tile && tile.loaded){
+                let tileIsBlending = _this._blendTile(
+                    tile,
+                    tile.x,
+                    tile.y,
+                    info.level,
+                    info.levelOpacity,
+                    currentTime,
+                    lowestLevel
+                );
+                _this._isBlending = _this._isBlending || tileIsBlending;
+                _this._needsDraw = _this._needsDraw || tileIsBlending || _this._wasBlending;
+            }
+        }
+
+        // Update each tile in the list of tiles. As the tiles are updated,
+        // the coverage provided is also updated. If a level provides coverage
+        // as part of this process, discard tiles from lower levels
+        let level = 0;
+        for(let i = 0; i < tiles.length; i++){
+            let tile = tiles[i];
+            updateTile(tile);
+            if(this._providesCoverage(this.coverage, tile.level)){
+                level = Math.max(level, tile.level);
+            }
+        }
+        if(level > 0){
+            for( let levelKey in this._tilesToDraw ){
+                if( levelKey < level ){
+                    delete this._tilesToDraw[levelKey];
+                }
+            }
+        }
+
+    },
+
+    /**
+     * Updates the opacity of a tile according to the time it has been on screen
+     * to perform a fade-in.
+     * Updates coverage once a tile is fully opaque.
+     * Returns whether the fade-in has completed.
+     * @private
+     *
+     * @param {OpenSeadragon.Tile} tile
+     * @param {Number} x
+     * @param {Number} y
+     * @param {Number} level
+     * @param {Number} levelOpacity
+     * @param {Number} currentTime
+     * @param {Boolean} lowestLevel
+     * @returns {Boolean} true if blending did not yet finish
+     */
+    _blendTile: function(tile, x, y, level, levelOpacity, currentTime, lowestLevel ){
+        let blendTimeMillis = 1000 * this.blendTime,
+            deltaTime,
+            opacity;
+
+        if ( !tile.blendStart ) {
+            tile.blendStart = currentTime;
+        }
+
+        deltaTime   = currentTime - tile.blendStart;
+        opacity     = blendTimeMillis ? Math.min( 1, deltaTime / ( blendTimeMillis ) ) : 1;
+
+        // if this tile is at the lowest level being drawn, render at opacity=1
+        if(level === lowestLevel){
+            opacity = 1;
+            deltaTime = blendTimeMillis;
+        }
+
+        if ( this.alwaysBlend ) {
+            opacity *= levelOpacity;
+        }
+        tile.opacity = opacity;
+
+        if ( opacity === 1 ) {
+            this._setCoverage( this.coverage, level, x, y, true );
+            this._hasOpaqueTile = true;
+        }
+        // return true if the tile is still blending
+        return deltaTime < blendTimeMillis;
+    },
+
+    /**
+     * Updates all tiles at a given resolution level.
+     * @private
+     * @param {Number} level
+     * @param {Number} levelOpacity
+     * @param {Number} levelVisibility
+     * @param {OpenSeadragon.Rect} drawArea
+     * @param {OpenSeadragon.Rect} loadArea
+     * @param {Number} currentTime
+     * @param {OpenSeadragon.Tile[]} best Array of the current best tiles
+     * @returns {Object} Dictionary {bestTiles: OpenSeadragon.Tile - the current "best" tiles to draw, updatedTiles: OpenSeadragon.Tile) - the updated tiles}.
+     */
+    _updateLevel: function(level, levelOpacity,
+                            levelVisibility, drawArea, loadArea, currentTime, best) {
+
+        var drawTopLeftBound = drawArea.getBoundingBox().getTopLeft();
+        var drawBottomRightBound = drawArea.getBoundingBox().getBottomRight();
+        if (this.viewer) {
+            /**
+             * <em>- Needs documentation -</em>
+             *
+             * @event update-level
+             * @memberof OpenSeadragon.Viewer
+             * @type {object}
+             * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
+             * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
+             * @property {Object} havedrawn - deprecated, always true (kept for backwards compatibility)
+             * @property {Object} level
+             * @property {Object} opacity
+             * @property {Object} visibility
+             * @property {OpenSeadragon.Rect} drawArea
+             * @property {Object} topleft deprecated, use drawArea instead
+             * @property {Object} bottomright deprecated, use drawArea instead
+             * @property {Object} currenttime
+             * @property {Object[]} best
+             * @property {?Object} userData - Arbitrary subscriber-defined object.
+             */
+            this.viewer.raiseEvent('update-level', {
+                tiledImage: this,
+                havedrawn: true, // deprecated, kept for backwards compatibility
+                level: level,
+                opacity: levelOpacity,
+                visibility: levelVisibility,
+                drawArea: drawArea,
+                topleft: drawTopLeftBound,
+                bottomright: drawBottomRightBound,
+                currenttime: currentTime,
+                best: best
+            });
+        }
+
+        var updatedTiles = this._updateDrawArea(level,
+            levelVisibility, drawArea, currentTime);
+
+        if (loadArea) {
+            best = this._updateLoadArea(level, loadArea, currentTime, best);
+        }
+
+        return {
+            bestTiles: best,
+            updatedTiles: updatedTiles
+        };
+    },
+
+    /**
+     * Visit all tiles in an a given area on a given level.
+     * @private
+     * @param {Number} level
+     * @param {OpenSeadragon.Rect} area
+     * @param {Function} callback - TiledImage, x, y, total
+     */
+    _visitTiles: function(level, area, callback) {
+        var topLeftBound = area.getBoundingBox().getTopLeft();
+        var bottomRightBound = area.getBoundingBox().getBottomRight();
+
+        var drawCornerTiles = this._getCornerTiles(level, topLeftBound, bottomRightBound);
+        var drawTopLeftTile = drawCornerTiles.topLeft;
+        var drawBottomRightTile = drawCornerTiles.bottomRight;
+
+
+        var numberOfTiles  = this.source.getNumTiles(level);
+
+        if (this.getFlip()) {
+            // The right-most tile can be narrower than the others. When flipped,
+            // this tile is now on the left. Because it is narrower than the normal
+            // left-most tile, the subsequent tiles may not be wide enough to completely
+            // fill the viewport. Fix this by rendering an extra column of tiles. If we
+            // are not wrapping, make sure we never render more than the number of tiles
+            // in the image.
+            drawBottomRightTile.x += 1;
+            if (!this.wrapHorizontal) {
+                drawBottomRightTile.x  = Math.min(drawBottomRightTile.x, numberOfTiles.x - 1);
+            }
+        }
+        var numTiles = Math.max(0, (drawBottomRightTile.x - drawTopLeftTile.x) * (drawBottomRightTile.y - drawTopLeftTile.y));
+
+        for (var x = drawTopLeftTile.x; x <= drawBottomRightTile.x; x++) {
+            for (var y = drawTopLeftTile.y; y <= drawBottomRightTile.y; y++) {
+
+                var flippedX;
+                if (this.getFlip()) {
+                    var xMod = ( numberOfTiles.x + ( x % numberOfTiles.x ) ) % numberOfTiles.x;
+                    flippedX = x + numberOfTiles.x - xMod - xMod - 1;
+                } else {
+                    flippedX = x;
+                }
+
+                if (area.intersection(this.getTileBounds(level, flippedX, y)) === null) {
+                    // This tile is not in the draw area
+                    continue;
+                }
+
+                callback(this, flippedX, y, numTiles);
+            }
+        }
+
+
+    },
+
+      /**
+     * Updates draw information for all tiles at a given level in the area
+     * @private
+     * @param {Number} level
+     * @param {Number} levelOpacity
+     * @param {Number} levelVisibility
+     * @param {OpenSeadragon.Rect} drawArea
+     * @param {Number} currentTime
+     * @param {OpenSeadragon.Tile[]} best Array of the current best tiles
+     * @returns {OpenSeadragon.Tile[]} Updated tiles
+     */
+    _updateDrawArea: function(level,
+                            levelVisibility, drawArea, currentTime) {
+        var numberOfTiles  = this.source.getNumTiles(level);
+        var viewportCenter = this.viewport.pixelFromPoint(this.viewport.getCenter());
+        this._resetCoverage(this.coverage, level);
+
+        var tiles = null;
+        var tileIndex = 0;
+
+        this._visitTiles(level, drawArea, function(tiledImage, x, y, total) {
+            if (!tiles) {
+                tiles = new Array(total);
+            }
+            tiles[tileIndex] = tiledImage._updateTile(
+                x, y,
+                level,
+                levelVisibility,
+                viewportCenter,
+                numberOfTiles,
+                currentTime
+            );
+
+            tileIndex += 1;
+
+        });
+
+        return tiles;
+    },
+
+        /**
+     * Updates load information for all tiles at a given level in the area
+     * @private
+     * @param {Number} level
+     * @param {OpenSeadragon.Rect} loadArea
+     * @param {Number} currentTime
+     * @param {OpenSeadragon.Tile[]} best Array of the current best tiles to load
+     * @returns {OpenSeadragon.Tile[]} The new best tiles to load
+     */
+    _updateLoadArea: function(level, loadArea, currentTime, best) {
+        this._resetCoverage(this.loadingCoverage, level);
+        var numberOfTiles  = this.source.getNumTiles(level);
+
+        this._visitTiles(level, loadArea, function(tiledImage, x, y, _) {
+            best = tiledImage._considerTileForLoad(
+                x, y,
+                level,
+                numberOfTiles,
+                currentTime,
+                best
+            );
+
+        });
+
+        return best;
+    },
+
+    /**
+     * @private
+     * @param {OpenSeadragon.Tile} tile
+     * @param {Boolean} overlap
+     * @param {OpenSeadragon.Viewport} viewport
+     * @param {OpenSeadragon.Point} viewportCenter
+     * @param {Number} levelVisibility
+     */
+    _positionTile: function( tile, overlap, viewport, viewportCenter, levelVisibility ){
+        var boundsTL = tile.bounds.getTopLeft();
+
+        boundsTL.x *= this._scaleSpring.current.value;
+        boundsTL.y *= this._scaleSpring.current.value;
+        boundsTL.x += this._xSpring.current.value;
+        boundsTL.y += this._ySpring.current.value;
+
+        var boundsSize   = tile.bounds.getSize();
+
+        boundsSize.x *= this._scaleSpring.current.value;
+        boundsSize.y *= this._scaleSpring.current.value;
+
+        tile.positionedBounds.x = boundsTL.x;
+        tile.positionedBounds.y = boundsTL.y;
+        tile.positionedBounds.width = boundsSize.x;
+        tile.positionedBounds.height = boundsSize.y;
+
+        var positionC = viewport.pixelFromPointNoRotate(boundsTL, true),
+            positionT = viewport.pixelFromPointNoRotate(boundsTL, false),
+            sizeC = viewport.deltaPixelsFromPointsNoRotate(boundsSize, true),
+            sizeT = viewport.deltaPixelsFromPointsNoRotate(boundsSize, false),
+            tileCenter = positionT.plus( sizeT.divide( 2 ) ),
+            tileSquaredDistance = viewportCenter.squaredDistanceTo( tileCenter );
+
+        if(this.viewer.drawer.minimumOverlapRequired(this)){
+            if ( !overlap ) {
+                sizeC = sizeC.plus( new $.Point(1, 1));
+            }
+
+            if (tile.isRightMost && this.wrapHorizontal) {
+                sizeC.x += 0.75; // Otherwise Firefox and Safari show seams
+            }
+
+            if (tile.isBottomMost && this.wrapVertical) {
+                sizeC.y += 0.75; // Otherwise Firefox and Safari show seams
+            }
+        }
+
+        tile.position   = positionC;
+        tile.size       = sizeC;
+        tile.squaredDistance   = tileSquaredDistance;
+        tile.visibility = levelVisibility;
+    },
+
+    /**
+     * Update a single tile at a particular resolution level.
+     * @private
+     * @param {Number} x
+     * @param {Number} y
+     * @param {Number} level
+     * @param {Number} levelVisibility
+     * @param {OpenSeadragon.Point} viewportCenter
+     * @param {Number} numberOfTiles
+     * @param {Number} currentTime
+     * @returns {OpenSeadragon.Tile} the updated Tile
+     */
+    _updateTile: function( x, y, level,
+                            levelVisibility, viewportCenter, numberOfTiles, currentTime){
+
+        const tile = this._getTile(
+            x, y,
+            level,
+            currentTime,
+            numberOfTiles
+        );
+
+
+        if( this.viewer ){
+            /**
+             * <em>- Needs documentation -</em>
+             *
+             * @event update-tile
+             * @memberof OpenSeadragon.Viewer
+             * @type {object}
+             * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
+             * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
+             * @property {OpenSeadragon.Tile} tile
+             * @property {?Object} userData - Arbitrary subscriber-defined object.
+             */
+            this.viewer.raiseEvent( 'update-tile', {
+                tiledImage: this,
+                tile: tile
+            });
+        }
+
+        this._setCoverage( this.coverage, level, x, y, false );
+
+        if ( !tile.exists ) {
+            return tile;
+        }
+        if (tile.loaded && tile.opacity === 1){
+            this._setCoverage( this.coverage, level, x, y, true );
+        }
+        this._positionTile(
+            tile,
+            this.source.tileOverlap,
+            this.viewport,
+            viewportCenter,
+            levelVisibility
+        );
+
+        return tile;
+    },
+
+    /**
+     * Consider a tile for loading
+     * @private
+     * @param {Number} x
+     * @param {Number} y
+     * @param {Number} level
+     * @param {Number} numberOfTiles
+     * @param {Number} currentTime
+     * @param {OpenSeadragon.Tile[]} best - The current "best" tiles to draw.
+     * @returns {OpenSeadragon.Tile[]}  - The updated "best" tiles to draw.
+     */
+    _considerTileForLoad: function( x, y, level, numberOfTiles, currentTime, best){
+
+        const tile = this._getTile(
+            x, y,
+            level,
+            currentTime,
+            numberOfTiles
+        );
+
+
+        var loadingCoverage = tile.loaded || tile.loading || this._isCovered(this.loadingCoverage, level, x, y);
+        this._setCoverage(this.loadingCoverage, level, x, y, loadingCoverage);
+
+
+        if ( !tile.exists ) {
+            return best;
+        }
+
+        // Try-find will populate tile with data if equal tile exists in system
+        if (!tile.loaded && !tile.loading && this._tryFindTileCacheRecord(tile)) {
+            loadingCoverage = true;
+        }
+
+        if ( tile.loading ) {
+            // the tile is already in the download queue
+            this._tilesLoading++;
+        } else if (!loadingCoverage) {
+            // add tile to best tiles to load only when not loaded already
+            best = this._compareTiles( best, tile, this._currentMaxTilesPerFrame );
+            if (this._currentMaxTilesPerFrame > this.maxTilesPerFrame) {
+                this._currentMaxTilesPerFrame = Math.max(Math.ceil(this.maxTilesPerFrame / 2), this.maxTilesPerFrame);
+            }
+        }
+
+        return best;
     },
 
     // private
@@ -1331,244 +1988,39 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * Updates all tiles at a given resolution level.
-     * @private
-     * @param {Boolean} haveDrawn
-     * @param {Boolean} drawLevel
-     * @param {Number} level
-     * @param {Number} levelOpacity
-     * @param {Number} levelVisibility
-     * @param {OpenSeadragon.Rect} drawArea
-     * @param {Number} currentTime
-     * @param {OpenSeadragon.Tile[]} best - The current "best" n tiles to draw.
-     */
-    _updateLevel: function(haveDrawn, drawLevel, level, levelOpacity,
-                           levelVisibility, drawArea, currentTime, best) {
-
-        var topLeftBound = drawArea.getBoundingBox().getTopLeft();
-        var bottomRightBound = drawArea.getBoundingBox().getBottomRight();
-
-        if (this.viewer) {
-            /**
-             * <em>- Needs documentation -</em>
-             *
-             * @event update-level
-             * @memberof OpenSeadragon.Viewer
-             * @type {object}
-             * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
-             * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
-             * @property {Object} havedrawn
-             * @property {Object} level
-             * @property {Object} opacity
-             * @property {Object} visibility
-             * @property {OpenSeadragon.Rect} drawArea
-             * @property {Object} topleft deprecated, use drawArea instead
-             * @property {Object} bottomright deprecated, use drawArea instead
-             * @property {Object} currenttime
-             * @property {Object[]} best
-             * @property {?Object} userData - Arbitrary subscriber-defined object.
-             */
-            this.viewer.raiseEvent('update-level', {
-                tiledImage: this,
-                havedrawn: haveDrawn,
-                level: level,
-                opacity: levelOpacity,
-                visibility: levelVisibility,
-                drawArea: drawArea,
-                topleft: topLeftBound,
-                bottomright: bottomRightBound,
-                currenttime: currentTime,
-                best: best
-            });
-        }
-
-        this._resetCoverage(this.coverage, level);
-        this._resetCoverage(this.loadingCoverage, level);
-
-        //OK, a new drawing so do your calculations
-        var cornerTiles = this._getCornerTiles(level, topLeftBound, bottomRightBound);
-        var topLeftTile = cornerTiles.topLeft;
-        var bottomRightTile = cornerTiles.bottomRight;
-        var numberOfTiles  = this.source.getNumTiles(level);
-
-        var viewportCenter = this.viewport.pixelFromPoint(this.viewport.getCenter());
-
-        if (this.getFlip()) {
-            // The right-most tile can be narrower than the others. When flipped,
-            // this tile is now on the left. Because it is narrower than the normal
-            // left-most tile, the subsequent tiles may not be wide enough to completely
-            // fill the viewport. Fix this by rendering an extra column of tiles. If we
-            // are not wrapping, make sure we never render more than the number of tiles
-            // in the image.
-            bottomRightTile.x += 1;
-            if (!this.wrapHorizontal) {
-                bottomRightTile.x  = Math.min(bottomRightTile.x, numberOfTiles.x - 1);
-            }
-        }
-
-        for (var x = topLeftTile.x; x <= bottomRightTile.x; x++) {
-            for (var y = topLeftTile.y; y <= bottomRightTile.y; y++) {
-
-                var flippedX;
-                if (this.getFlip()) {
-                    var xMod = ( numberOfTiles.x + ( x % numberOfTiles.x ) ) % numberOfTiles.x;
-                    flippedX = x + numberOfTiles.x - xMod - xMod - 1;
-                } else {
-                    flippedX = x;
-                }
-
-                if (drawArea.intersection(this.getTileBounds(level, flippedX, y)) === null) {
-                    // This tile is outside of the viewport, no need to draw it
-                    continue;
-                }
-
-                best = this._updateTile(
-                    drawLevel,
-                    haveDrawn,
-                    flippedX, y,
-                    level,
-                    levelOpacity,
-                    levelVisibility,
-                    viewportCenter,
-                    numberOfTiles,
-                    currentTime,
-                    best
-                );
-            }
-        }
-
-        return best;
-    },
-
-    /**
      * @private
      * @inner
-     * Update a single tile at a particular resolution level.
-     * @param {Boolean} haveDrawn
-     * @param {Boolean} drawLevel
-     * @param {Number} x
-     * @param {Number} y
-     * @param {Number} level
-     * @param {Number} levelOpacity
-     * @param {Number} levelVisibility
-     * @param {OpenSeadragon.Point} viewportCenter
-     * @param {Number} numberOfTiles
-     * @param {Number} currentTime
-     * @param {OpenSeadragon.Tile[]} best - The current "best" tiles to draw.
+     * Try to find existing cache of the tile
+     * @param {OpenSeadragon.Tile} tile
      */
-    _updateTile: function( haveDrawn, drawLevel, x, y, level, levelOpacity,
-                           levelVisibility, viewportCenter, numberOfTiles, currentTime, best){
+    _tryFindTileCacheRecord: function(tile) {
+        let record = this._tileCache.getCacheRecord(tile.originalCacheKey);
 
-        var tile = this._getTile(
-            x, y,
-            level,
-            currentTime,
-            numberOfTiles,
-            this._worldWidthCurrent,
-            this._worldHeightCurrent
-            ),
-            drawTile = drawLevel;
-
-        if( this.viewer ){
-            /**
-             * <em>- Needs documentation -</em>
-             *
-             * @event update-tile
-             * @memberof OpenSeadragon.Viewer
-             * @type {object}
-             * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
-             * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
-             * @property {OpenSeadragon.Tile} tile
-             * @property {?Object} userData - Arbitrary subscriber-defined object.
-             */
-            this.viewer.raiseEvent( 'update-tile', {
-                tiledImage: this,
-                tile: tile
-            });
+        if (!record) {
+            return false;
         }
-
-        this._setCoverage( this.coverage, level, x, y, false );
-
-        var loadingCoverage = tile.loaded || tile.loading || this._isCovered(this.loadingCoverage, level, x, y);
-        this._setCoverage(this.loadingCoverage, level, x, y, loadingCoverage);
-
-        if ( !tile.exists ) {
-            return best;
-        }
-
-        if ( haveDrawn && !drawTile ) {
-            if ( this._isCovered( this.coverage, level, x, y ) ) {
-                this._setCoverage( this.coverage, level, x, y, true );
-            } else {
-                drawTile = true;
-            }
-        }
-
-        if ( !drawTile ) {
-            return best;
-        }
-
-        this._positionTile(
-            tile,
-            this.source.tileOverlap,
-            this.viewport,
-            viewportCenter,
-            levelVisibility
-        );
-
-        if (!tile.loaded) {
-            if (tile.context2D) {
-                this._setTileLoaded(tile);
-            } else {
-                var imageRecord = this._tileCache.getImageRecord(tile.cacheKey);
-                if (imageRecord) {
-                    this._setTileLoaded(tile, imageRecord.getData());
-                }
-            }
-        }
-
-        if ( tile.loaded ) {
-            var needsDraw = this._blendTile(
-                tile,
-                x, y,
-                level,
-                levelOpacity,
-                currentTime
-            );
-
-            if ( needsDraw ) {
-                this._needsDraw = true;
-            }
-        } else if ( tile.loading ) {
-            // the tile is already in the download queue
-            this._tilesLoading++;
-        } else if (!loadingCoverage) {
-            best = this._compareTiles( best, tile, this.maxTilesPerFrame );
-        }
-
-        return best;
+        tile.loading = true;
+        this._setTileLoaded(tile, record.data, null, null, record.type);
+        return true;
     },
 
     /**
      * @private
      * @inner
      * Obtains a tile at the given location.
+     * @private
      * @param {Number} x
      * @param {Number} y
      * @param {Number} level
      * @param {Number} time
      * @param {Number} numTiles
-     * @param {Number} worldWidth
-     * @param {Number} worldHeight
      * @returns {OpenSeadragon.Tile}
      */
     _getTile: function(
         x, y,
         level,
         time,
-        numTiles,
-        worldWidth,
-        worldHeight
+        numTiles
     ) {
         var xMod,
             yMod,
@@ -1578,7 +2030,6 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             urlOrGetter,
             post,
             ajaxHeaders,
-            context2D,
             tile,
             tilesMatrix = this.tilesMatrix,
             tileSource = this.source;
@@ -1610,9 +2061,6 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
                 ajaxHeaders = null;
             }
 
-            context2D = tileSource.getContext2D ?
-                tileSource.getContext2D(level, xMod, yMod) : undefined;
-
             tile = new $.Tile(
                 level,
                 x,
@@ -1620,7 +2068,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
                 bounds,
                 exists,
                 urlOrGetter,
-                context2D,
+                undefined,
                 this.loadTilesWithAjax,
                 ajaxHeaders,
                 sourceBounds,
@@ -1654,16 +2102,16 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * @private
-     * @inner
      * Dispatch a job to the ImageLoader to load the Image for a Tile.
+     * @private
      * @param {OpenSeadragon.Tile} tile
      * @param {Number} time
      */
     _loadTile: function(tile, time ) {
         var _this = this;
         tile.loading = true;
-        this._imageLoader.addJob({
+        tile.tiledImage = this;
+        if (!this._imageLoader.addJob({
             src: tile.getUrl(),
             tile: tile,
             source: this.source,
@@ -1672,27 +2120,44 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             ajaxHeaders: tile.ajaxHeaders,
             crossOriginPolicy: this.crossOriginPolicy,
             ajaxWithCredentials: this.ajaxWithCredentials,
-            callback: function( data, errorMsg, tileRequest ){
-                _this._onTileLoad( tile, time, data, errorMsg, tileRequest );
+            callback: function( data, errorMsg, tileRequest, dataType ){
+                _this._onTileLoad( tile, time, data, errorMsg, tileRequest, dataType );
             },
             abort: function() {
                 tile.loading = false;
             }
-        });
+        })) {
+            /**
+             * Triggered if tile load job was added to a full queue.
+             * This allows to react upon e.g. network not being able to serve the tiles fast enough.
+             * @event job-queue-full
+             * @memberof OpenSeadragon.Viewer
+             * @type {object}
+             * @property {OpenSeadragon.Tile} tile - The tile that failed to load.
+             * @property {OpenSeadragon.TiledImage} tiledImage - The tiled image the tile belongs to.
+             * @property {number} time - The time in milliseconds when the tile load began.
+             */
+            this.viewer.raiseEvent("job-queue-full", {
+                tile: tile,
+                tiledImage: this,
+                time: time,
+            });
+        }
     },
 
     /**
-     * @private
-     * @inner
      * Callback fired when a Tile's Image finished downloading.
+     * @private
      * @param {OpenSeadragon.Tile} tile
      * @param {Number} time
      * @param {*} data image data
      * @param {String} errorMsg
      * @param {XMLHttpRequest} tileRequest
+     * @param {String} [dataType=undefined] data type, derived automatically if not set
      */
-    _onTileLoad: function( tile, time, data, errorMsg, tileRequest ) {
-        if ( !data ) {
+    _onTileLoad: function( tile, time, data, errorMsg, tileRequest, dataType ) {
+        //data is set to null on error by image loader, allow custom falsey values (e.g. 0)
+        if ( data === null || data === undefined ) {
             $.console.error( "Tile %s failed to load: %s - error: %s", tile, tile.getUrl(), errorMsg );
             /**
              * Triggered when a tile fails to load.
@@ -1726,35 +2191,50 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             return;
         }
 
-        var _this = this,
-            finish = function() {
-                var ccc = _this.source;
-                var cutoff = ccc.getClosestLevel();
-                _this._setTileLoaded(tile, data, cutoff, tileRequest);
-        };
-
-        // Check if we're mid-update; this can happen on IE8 because image load events for
-        // cached images happen immediately there
-        if ( !this._midDraw ) {
-            finish();
-        } else {
-            // Wait until after the update, in case caching unloads any tiles
-            window.setTimeout( finish, 1);
-        }
+        this._setTileLoaded(tile, data, null, tileRequest, dataType);
     },
 
     /**
      * @private
-     * @inner
      * @param {OpenSeadragon.Tile} tile
-     * @param {*} data image data, the data sent to ImageJob.prototype.finish(), by default an Image object
-     * @param {Number|undefined} cutoff
-     * @param {XMLHttpRequest|undefined} tileRequest
+     * @param {*} data image data, the data sent to ImageJob.prototype.finish(), by default an Image object,
+     *   can be null: in that case, cache is assigned to a tile without further processing
+     * @param {?Number} cutoff ignored, @deprecated
+     * @param {?XMLHttpRequest} tileRequest
+     * @param {?String} [dataType=undefined] data type, derived automatically if not set
      */
-    _setTileLoaded: function(tile, data, cutoff, tileRequest) {
-        var increment = 0,
-            eventFinished = false,
-            _this = this;
+    _setTileLoaded: function(tile, data, cutoff, tileRequest, dataType) {
+        tile.tiledImage = this; //unloaded with tile.unload(), so we need to set it back
+        // does nothing if tile.cacheKey already present
+
+        let tileCacheCreated = false;
+        tile.addCache(tile.cacheKey, () => {
+            tileCacheCreated = true;
+            return data;
+        }, dataType, false, false);
+
+        let resolver = null,
+            increment = 0,
+            eventFinished = false;
+        const _this = this,
+            now = $.now();
+
+        function completionCallback() {
+            increment--;
+            if (increment > 0) {
+                return;
+            }
+            eventFinished = true;
+
+            //do not override true if set (false is default)
+            tile.hasTransparency = tile.hasTransparency || _this.source.hasTransparency(
+                undefined, tile.getUrl(), tile.ajaxHeaders, tile.postData
+            );
+            tile.loading = false;
+            tile.loaded = true;
+            _this.redraw();
+            resolver(tile);
+        }
 
         function getCompletionCallback() {
             if (eventFinished) {
@@ -1765,160 +2245,88 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
             return completionCallback;
         }
 
-        function completionCallback() {
-            increment--;
-            if (increment === 0) {
-                tile.loading = false;
-                tile.loaded = true;
-                tile.hasTransparency = _this.source.hasTransparency(
-                    tile.context2D, tile.getUrl(), tile.ajaxHeaders, tile.postData
-                );
-                if (!tile.context2D) {
-                    _this._tileCache.cacheTile({
-                        data: data,
-                        tile: tile,
-                        cutoff: cutoff,
-                        tiledImage: _this
+        function markTileAsReady() {
+            const fallbackCompletion = getCompletionCallback();
+
+            /**
+             * Triggered when a tile has just been loaded in memory. That means that the
+             * image has been downloaded and can be modified before being drawn to the canvas.
+             * This event is _awaiting_, it supports asynchronous functions or functions that return a promise.
+             *
+             * @event tile-loaded
+             * @memberof OpenSeadragon.Viewer
+             * @type {object}
+             * @property {Image|*} image - The image (data) of the tile. Deprecated.
+             * @property {*} data image data, the data sent to ImageJob.prototype.finish(),
+             *   by default an Image object. Deprecated
+             * @property {String} dataType type of the data
+             * @property {OpenSeadragon.TiledImage} tiledImage - The tiled image of the loaded tile.
+             * @property {OpenSeadragon.Tile} tile - The tile which has been loaded.
+             * @property {XMLHttpRequest} tileRequest - The AJAX request that loaded this tile (if applicable).
+             * @property {OpenSeadragon.Promise} - Promise resolved when the tile gets fully loaded.
+             *  NOTE: do no await the promise in the handler: you will create a deadlock!
+             * @property {function} getCompletionCallback - deprecated
+             */
+            _this.viewer.raiseEventAwaiting("tile-loaded", {
+                tile: tile,
+                tiledImage: _this,
+                tileRequest: tileRequest,
+                promise: new $.Promise(resolve => {
+                    resolver = resolve;
+                }),
+                get image() {
+                    $.console.error("[tile-loaded] event 'image' has been deprecated. Use 'tile-invalidated' event to modify data instead.");
+                    return data;
+                },
+                get data() {
+                    $.console.error("[tile-loaded] event 'data' has been deprecated. Use 'tile-invalidated' event to modify data instead.");
+                    return data;
+                },
+                getCompletionCallback: function () {
+                    $.console.error("[tile-loaded] getCompletionCallback is deprecated: it introduces race conditions: " +
+                        "use async event handlers instead, execution order is deducted by addHandler(...) priority argument.");
+                    return getCompletionCallback();
+                },
+            }).catch(() => {
+                $.console.error("[tile-loaded] event finished with failure: there might be a problem with a plugin you are using.");
+            }).then(fallbackCompletion);
+        }
+
+
+        if (tileCacheCreated) {
+            _this.viewer.world.requestTileInvalidateEvent([tile], now, false, true).then(markTileAsReady);
+        } else {
+            // Tile-invalidated not called on each tile, but only on tiles with new data! Verify we share the main cache
+            const origCache = tile.getCache(tile.originalCacheKey);
+            for (let t of origCache._tiles) {
+
+                // if there exists a tile that has different main cache, inherit it as a main cache
+                if (t.cacheKey !== tile.cacheKey) {
+
+                    // add reference also to the main cache, no matter what the other tile state has
+                    // completion of the invaldate event should take care of all such tiles
+                    const targetMainCache = t.getCache();
+                    tile.setCache(t.cacheKey, targetMainCache, true, false);
+                    break;
+                } else if (t.processing) {
+                    // Await once processing finishes - mark tile as loaded
+                    t.processingPromise.then(t => {
+                        const targetMainCache = t.getCache();
+                        tile.setCache(t.cacheKey, targetMainCache, true, false);
+                        markTileAsReady();
                     });
+                    return;
                 }
-                _this._needsDraw = true;
             }
+            markTileAsReady();
         }
-
-        /**
-         * Triggered when a tile has just been loaded in memory. That means that the
-         * image has been downloaded and can be modified before being drawn to the canvas.
-         *
-         * @event tile-loaded
-         * @memberof OpenSeadragon.Viewer
-         * @type {object}
-         * @property {Image|*} image - The image (data) of the tile. Deprecated.
-         * @property {*} data image data, the data sent to ImageJob.prototype.finish(), by default an Image object
-         * @property {OpenSeadragon.TiledImage} tiledImage - The tiled image of the loaded tile.
-         * @property {OpenSeadragon.Tile} tile - The tile which has been loaded.
-         * @property {XMLHttpRequest} tileRequest - The AJAX request that loaded this tile (if applicable).
-         * @property {function} getCompletionCallback - A function giving a callback to call
-         * when the asynchronous processing of the image is done. The image will be
-         * marked as entirely loaded when the callback has been called once for each
-         * call to getCompletionCallback.
-         */
-
-        var fallbackCompletion = getCompletionCallback();
-        this.viewer.raiseEvent("tile-loaded", {
-            tile: tile,
-            tiledImage: this,
-            tileRequest: tileRequest,
-            get image() {
-                $.console.error("[tile-loaded] event 'image' has been deprecated. Use 'data' property instead.");
-                return data;
-            },
-            data: data,
-            getCompletionCallback: getCompletionCallback
-        });
-        eventFinished = true;
-        // In case the completion callback is never called, we at least force it once.
-        fallbackCompletion();
-    },
-
-    /**
-     * @private
-     * @inner
-     * @param {OpenSeadragon.Tile} tile
-     * @param {Boolean} overlap
-     * @param {OpenSeadragon.Viewport} viewport
-     * @param {OpenSeadragon.Point} viewportCenter
-     * @param {Number} levelVisibility
-     */
-    _positionTile: function( tile, overlap, viewport, viewportCenter, levelVisibility ){
-        var boundsTL = tile.bounds.getTopLeft();
-
-        boundsTL.x *= this._scaleSpring.current.value;
-        boundsTL.y *= this._scaleSpring.current.value;
-        boundsTL.x += this._xSpring.current.value;
-        boundsTL.y += this._ySpring.current.value;
-
-        var boundsSize   = tile.bounds.getSize();
-
-        boundsSize.x *= this._scaleSpring.current.value;
-        boundsSize.y *= this._scaleSpring.current.value;
-
-        var positionC = viewport.pixelFromPointNoRotate(boundsTL, true),
-            positionT = viewport.pixelFromPointNoRotate(boundsTL, false),
-            sizeC = viewport.deltaPixelsFromPointsNoRotate(boundsSize, true),
-            sizeT = viewport.deltaPixelsFromPointsNoRotate(boundsSize, false),
-            tileCenter = positionT.plus( sizeT.divide( 2 ) ),
-            tileSquaredDistance = viewportCenter.squaredDistanceTo( tileCenter );
-
-        if ( !overlap ) {
-            sizeC = sizeC.plus( new $.Point( 1, 1 ) );
-        }
-
-        if (tile.isRightMost && this.wrapHorizontal) {
-            sizeC.x += 0.75; // Otherwise Firefox and Safari show seams
-        }
-
-        if (tile.isBottomMost && this.wrapVertical) {
-            sizeC.y += 0.75; // Otherwise Firefox and Safari show seams
-        }
-
-        tile.position   = positionC;
-        tile.size       = sizeC;
-        tile.squaredDistance   = tileSquaredDistance;
-        tile.visibility = levelVisibility;
-    },
-
-    /**
-     * @private
-     * @inner
-     * Updates the opacity of a tile according to the time it has been on screen
-     * to perform a fade-in.
-     * Updates coverage once a tile is fully opaque.
-     * Returns whether the fade-in has completed.
-     *
-     * @param {OpenSeadragon.Tile} tile
-     * @param {Number} x
-     * @param {Number} y
-     * @param {Number} level
-     * @param {Number} levelOpacity
-     * @param {Number} currentTime
-     * @returns {Boolean}
-     */
-    _blendTile: function( tile, x, y, level, levelOpacity, currentTime ){
-        var blendTimeMillis = 1000 * this.blendTime,
-            deltaTime,
-            opacity;
-
-        if ( !tile.blendStart ) {
-            tile.blendStart = currentTime;
-        }
-
-        deltaTime   = currentTime - tile.blendStart;
-        opacity     = blendTimeMillis ? Math.min( 1, deltaTime / ( blendTimeMillis ) ) : 1;
-
-        if ( this.alwaysBlend ) {
-            opacity *= levelOpacity;
-        }
-
-        tile.opacity = opacity;
-
-        this.lastDrawn.push( tile );
-
-        if ( opacity === 1 ) {
-            this._setCoverage( this.coverage, level, x, y, true );
-            this._hasOpaqueTile = true;
-        } else if ( deltaTime < blendTimeMillis ) {
-            return true;
-        }
-
-        return false;
     },
 
 
     /**
-     * @private
-     * @inner
      * Determines the 'best tiles' from the given 'last best' tiles and the
      * tile in question.
+     * @private
      *
      * @param {OpenSeadragon.Tile[]} previousBest The best tiles so far.
      * @param {OpenSeadragon.Tile} tile The new tile to consider.
@@ -1938,9 +2346,8 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * @private
-     * @inner
      * Sorts tiles in an array according to distance and visibility.
+     * @private
      *
      * @param {OpenSeadragon.Tile[]} tiles The tiles.
      */
@@ -1953,284 +2360,16 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
                 return -1;
             }
             if (a.visibility === b.visibility) {
+                // sort by smallest squared distance
                 return (a.squaredDistance - b.squaredDistance);
             } else {
-                return (a.visibility - b.visibility);
+                // sort by largest visibility value
+                return (b.visibility - a.visibility);
             }
         });
     },
 
     /**
-     * @private
-     * @inner
-     * Draws a TiledImage.
-     * @param {OpenSeadragon.Tile[]} lastDrawn - An unordered list of Tiles drawn last frame.
-     */
-    _drawTiles: function( lastDrawn ) {
-        if (this.opacity === 0 || (lastDrawn.length === 0 && !this.placeholderFillStyle)) {
-            return;
-        }
-
-        var tile = lastDrawn[0];
-        var useSketch;
-
-        if (tile) {
-            useSketch = this.opacity < 1 ||
-                (this.compositeOperation && this.compositeOperation !== 'source-over') ||
-                (!this._isBottomItem() &&
-                    this.source.hasTransparency(tile.context2D, tile.getUrl(), tile.ajaxHeaders, tile.postData));
-        }
-
-        var sketchScale;
-        var sketchTranslate;
-
-        var zoom = this.viewport.getZoom(true);
-        var imageZoom = this.viewportToImageZoom(zoom);
-
-        if (lastDrawn.length > 1 &&
-            imageZoom > this.smoothTileEdgesMinZoom &&
-            !this.iOSDevice &&
-            this.getRotation(true) % 360 === 0 && // TODO: support tile edge smoothing with tiled image rotation (viewport rotation is not a problem).
-            this._drawer.viewer.viewport.getFlip() === false && // TODO: support tile edge smoothing with viewport flip (tiled image flip is not a problem).
-            $.supportsCanvas && this.viewer.useCanvas) {
-            // When zoomed in a lot (>100%) the tile edges are visible.
-            // So we have to composite them at ~100% and scale them up together.
-            // Note: Disabled on iOS devices per default as it causes a native crash
-            useSketch = true;
-            sketchScale = tile.getScaleForEdgeSmoothing();
-            sketchTranslate = tile.getTranslationForEdgeSmoothing(sketchScale,
-                this._drawer.getCanvasSize(false),
-                this._drawer.getCanvasSize(true));
-        }
-
-        var bounds;
-        if (useSketch) {
-            if (!sketchScale) {
-                // Except when edge smoothing, we only clean the part of the
-                // sketch canvas we are going to use for performance reasons.
-                bounds = this.viewport.viewportToViewerElementRectangle(
-                    this.getClippedBounds(true))
-                    .getIntegerBoundingBox();
-
-                if(this._drawer.viewer.viewport.getFlip()) {
-                    if (this.viewport.getRotation(true) % 360 !== 0 ||
-                        this.getRotation(true) % 360 !== 0) {
-                        bounds.x = this._drawer.viewer.container.clientWidth - (bounds.x + bounds.width);
-                    }
-                }
-
-                bounds = bounds.times($.pixelDensityRatio);
-            }
-            this._drawer._clear(true, bounds);
-        }
-
-        // When scaling, we must rotate only when blending the sketch canvas to
-        // avoid interpolation
-        if (!sketchScale) {
-            if (this.viewport.getRotation(true) % 360 !== 0) {
-                this._drawer._offsetForRotation({
-                    degrees: this.viewport.getRotation(true),
-                    useSketch: useSketch
-                });
-            }
-            if (this.getRotation(true) % 360 !== 0) {
-                this._drawer._offsetForRotation({
-                    degrees: this.getRotation(true),
-                    point: this.viewport.pixelFromPointNoRotate(
-                        this._getRotationPoint(true), true),
-                    useSketch: useSketch
-                });
-            }
-
-            if (this.viewport.getRotation(true) % 360 === 0 &&
-                this.getRotation(true) % 360 === 0) {
-                if(this._drawer.viewer.viewport.getFlip()) {
-                    this._drawer._flip();
-                }
-            }
-        }
-
-        var usedClip = false;
-        if ( this._clip ) {
-            this._drawer.saveContext(useSketch);
-
-            var box = this.imageToViewportRectangle(this._clip, true);
-            box = box.rotate(-this.getRotation(true), this._getRotationPoint(true));
-            var clipRect = this._drawer.viewportToDrawerRectangle(box);
-            if (sketchScale) {
-                clipRect = clipRect.times(sketchScale);
-            }
-            if (sketchTranslate) {
-                clipRect = clipRect.translate(sketchTranslate);
-            }
-            this._drawer.setClip(clipRect, useSketch);
-
-            usedClip = true;
-        }
-
-        if (this._croppingPolygons) {
-            var self = this;
-            this._drawer.saveContext(useSketch);
-            try {
-                var polygons = this._croppingPolygons.map(function (polygon) {
-                    return polygon.map(function (coord) {
-                        var point = self
-                            .imageToViewportCoordinates(coord.x, coord.y, true)
-                            .rotate(-self.getRotation(true), self._getRotationPoint(true));
-                        var clipPoint = self._drawer.viewportCoordToDrawerCoord(point);
-                        if (sketchScale) {
-                            clipPoint = clipPoint.times(sketchScale);
-                        }
-                        if (sketchTranslate) {
-                            clipPoint = clipPoint.plus(sketchTranslate);
-                        }
-                        return clipPoint;
-                    });
-                });
-                this._drawer.clipWithPolygons(polygons, useSketch);
-            } catch (e) {
-                $.console.error(e);
-            }
-            usedClip = true;
-        }
-
-        if ( this.placeholderFillStyle && this._hasOpaqueTile === false ) {
-            var placeholderRect = this._drawer.viewportToDrawerRectangle(this.getBounds(true));
-            if (sketchScale) {
-                placeholderRect = placeholderRect.times(sketchScale);
-            }
-            if (sketchTranslate) {
-                placeholderRect = placeholderRect.translate(sketchTranslate);
-            }
-
-            var fillStyle = null;
-            if ( typeof this.placeholderFillStyle === "function" ) {
-                fillStyle = this.placeholderFillStyle(this, this._drawer.context);
-            }
-            else {
-                fillStyle = this.placeholderFillStyle;
-            }
-
-            this._drawer.drawRectangle(placeholderRect, fillStyle, useSketch);
-        }
-
-        var subPixelRoundingRule = determineSubPixelRoundingRule(this.subPixelRoundingForTransparency);
-
-        var shouldRoundPositionAndSize = false;
-
-        if (subPixelRoundingRule === $.SUBPIXEL_ROUNDING_OCCURRENCES.ALWAYS) {
-            shouldRoundPositionAndSize = true;
-        } else if (subPixelRoundingRule === $.SUBPIXEL_ROUNDING_OCCURRENCES.ONLY_AT_REST) {
-            var isAnimating = this.viewer && this.viewer.isAnimating();
-            shouldRoundPositionAndSize = !isAnimating;
-        }
-
-        for (var i = lastDrawn.length - 1; i >= 0; i--) {
-            tile = lastDrawn[ i ];
-            this._drawer.drawTile( tile, this._drawingHandler, useSketch, sketchScale,
-                sketchTranslate, shouldRoundPositionAndSize, this.source );
-            tile.beingDrawn = true;
-
-            if( this.viewer ){
-                /**
-                 * <em>- Needs documentation -</em>
-                 *
-                 * @event tile-drawn
-                 * @memberof OpenSeadragon.Viewer
-                 * @type {object}
-                 * @property {OpenSeadragon.Viewer} eventSource - A reference to the Viewer which raised the event.
-                 * @property {OpenSeadragon.TiledImage} tiledImage - Which TiledImage is being drawn.
-                 * @property {OpenSeadragon.Tile} tile
-                 * @property {?Object} userData - Arbitrary subscriber-defined object.
-                 */
-                this.viewer.raiseEvent( 'tile-drawn', {
-                    tiledImage: this,
-                    tile: tile
-                });
-            }
-        }
-
-        if ( usedClip ) {
-            this._drawer.restoreContext( useSketch );
-        }
-
-        if (!sketchScale) {
-            if (this.getRotation(true) % 360 !== 0) {
-                this._drawer._restoreRotationChanges(useSketch);
-            }
-            if (this.viewport.getRotation(true) % 360 !== 0) {
-                this._drawer._restoreRotationChanges(useSketch);
-            }
-        }
-
-        if (useSketch) {
-            if (sketchScale) {
-                if (this.viewport.getRotation(true) % 360 !== 0) {
-                    this._drawer._offsetForRotation({
-                        degrees: this.viewport.getRotation(true),
-                        useSketch: false
-                    });
-                }
-                if (this.getRotation(true) % 360 !== 0) {
-                    this._drawer._offsetForRotation({
-                        degrees: this.getRotation(true),
-                        point: this.viewport.pixelFromPointNoRotate(
-                            this._getRotationPoint(true), true),
-                        useSketch: false
-                    });
-                }
-            }
-            this._drawer.blendSketch({
-                opacity: this.opacity,
-                scale: sketchScale,
-                translate: sketchTranslate,
-                compositeOperation: this.compositeOperation,
-                bounds: bounds
-            });
-            if (sketchScale) {
-                if (this.getRotation(true) % 360 !== 0) {
-                    this._drawer._restoreRotationChanges(false);
-                }
-                if (this.viewport.getRotation(true) % 360 !== 0) {
-                    this._drawer._restoreRotationChanges(false);
-                }
-            }
-        }
-
-        if (!sketchScale) {
-            if (this.viewport.getRotation(true) % 360 === 0 &&
-                this.getRotation(true) % 360 === 0) {
-                if(this._drawer.viewer.viewport.getFlip()) {
-                    this._drawer._flip();
-                }
-            }
-        }
-
-        this._drawDebugInfo( lastDrawn );
-    },
-
-    /**
-     * @private
-     * @inner
-     * Draws special debug information for a TiledImage if in debug mode.
-     * @param {OpenSeadragon.Tile[]} lastDrawn - An unordered list of Tiles drawn last frame.
-     */
-    _drawDebugInfo: function( lastDrawn ) {
-        if( this.debugMode ) {
-            for ( var i = lastDrawn.length - 1; i >= 0; i-- ) {
-                var tile = lastDrawn[ i ];
-                try {
-                    this._drawer.drawDebugInfo(tile, lastDrawn.length, i, this);
-                } catch(e) {
-                    $.console.error(e);
-                }
-            }
-        }
-    },
-
-    /**
-     * @private
-     * @inner
      * Returns true if the given tile provides coverage to lower-level tiles of
      * lower resolution representing the same content. If neither x nor y is
      * given, returns true if the entire visible level provides coverage.
@@ -2238,6 +2377,7 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
      * Note that out-of-bounds tiles provide coverage in this sense, since
      * there's no content that they would need to cover. Tiles at non-existent
      * levels that are within the image bounds, however, do not.
+     * @private
      *
      * @param {Object} coverage - A '3d' dictionary [level][x][y] --> Boolean.
      * @param {Number} level - The resolution level of the tile.
@@ -2278,11 +2418,10 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * @private
-     * @inner
      * Returns true if the given tile is completely covered by higher-level
      * tiles of higher resolution representing the same content. If neither x
      * nor y is given, returns true if the entire visible level is covered.
+     * @private
      *
      * @param {Object} coverage - A '3d' dictionary [level][x][y] --> Boolean.
      * @param {Number} level - The resolution level of the tile.
@@ -2304,9 +2443,8 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * @private
-     * @inner
      * Sets whether the given tile provides coverage or not.
+     * @private
      *
      * @param {Object} coverage - A '3d' dictionary [level][x][y] --> Boolean.
      * @param {Number} level - The resolution level of the tile.
@@ -2331,11 +2469,10 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
     },
 
     /**
-     * @private
-     * @inner
      * Resets coverage information for the given level. This should be called
      * after every draw routine. Note that at the beginning of the next draw
      * routine, coverage for every visible tile should be explicitly set.
+     * @private
      *
      * @param {Object} coverage - A '3d' dictionary [level][x][y] --> Boolean.
      * @param {Number} level - The resolution level of tiles to completely reset.
@@ -2346,71 +2483,5 @@ $.extend($.TiledImage.prototype, $.EventSource.prototype, /** @lends OpenSeadrag
 });
 
 
-/**
- * @private
- * @inner
- * Defines the value for subpixel rounding to fallback to in case of missing or
- * invalid value.
- */
-var DEFAULT_SUBPIXEL_ROUNDING_RULE = $.SUBPIXEL_ROUNDING_OCCURRENCES.NEVER;
-
-/**
- * @private
- * @inner
- * Checks whether the input value is an invalid subpixel rounding enum value.
- *
- * @param {SUBPIXEL_ROUNDING_OCCURRENCES} value - The subpixel rounding enum value to check.
- * @returns {Boolean} Returns true if the input value is none of the expected
- * {@link SUBPIXEL_ROUNDING_OCCURRENCES.ALWAYS}, {@link SUBPIXEL_ROUNDING_OCCURRENCES.ONLY_AT_REST} or {@link SUBPIXEL_ROUNDING_OCCURRENCES.NEVER} value.
- */
-function isSubPixelRoundingRuleUnknown(value) {
-    return value !== $.SUBPIXEL_ROUNDING_OCCURRENCES.ALWAYS &&
-        value !== $.SUBPIXEL_ROUNDING_OCCURRENCES.ONLY_AT_REST &&
-        value !== $.SUBPIXEL_ROUNDING_OCCURRENCES.NEVER;
-}
-
-/**
- * @private
- * @inner
- * Ensures the returned value is always a valid subpixel rounding enum value,
- * defaulting to {@link SUBPIXEL_ROUNDING_OCCURRENCES.NEVER} if input is missing or invalid.
- *
- * @param {SUBPIXEL_ROUNDING_OCCURRENCES} value - The subpixel rounding enum value to normalize.
- * @returns {SUBPIXEL_ROUNDING_OCCURRENCES} Returns a valid subpixel rounding enum value.
- */
-function normalizeSubPixelRoundingRule(value) {
-    if (isSubPixelRoundingRuleUnknown(value)) {
-        return DEFAULT_SUBPIXEL_ROUNDING_RULE;
-    }
-    return value;
-}
-
-/**
- * @private
- * @inner
- * Ensures the returned value is always a valid subpixel rounding enum value,
- * defaulting to 'NEVER' if input is missing or invalid.
- *
- * @param {Object} subPixelRoundingRules - A subpixel rounding enum values dictionary [{@link BROWSERS}] --> {@link SUBPIXEL_ROUNDING_OCCURRENCES}.
- * @returns {SUBPIXEL_ROUNDING_OCCURRENCES} Returns the determined subpixel rounding enum value for the
- * current browser.
- */
-function determineSubPixelRoundingRule(subPixelRoundingRules) {
-    if (typeof subPixelRoundingRules === 'number') {
-        return normalizeSubPixelRoundingRule(subPixelRoundingRules);
-    }
-
-    if (!subPixelRoundingRules || !$.Browser) {
-        return DEFAULT_SUBPIXEL_ROUNDING_RULE;
-    }
-
-    var subPixelRoundingRule = subPixelRoundingRules[$.Browser.vendor];
-
-    if (isSubPixelRoundingRuleUnknown(subPixelRoundingRule)) {
-        subPixelRoundingRule = subPixelRoundingRules['*'];
-    }
-
-    return normalizeSubPixelRoundingRule(subPixelRoundingRule);
-}
 
 }( OpenSeadragon ));

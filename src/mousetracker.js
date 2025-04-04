@@ -2,7 +2,7 @@
  * OpenSeadragon - MouseTracker
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -135,7 +135,7 @@
             };
         }
 
-        this.hash               = Math.random(); // An unique hash for this tracker.
+        this.hash               = uniqueHash(); // An unique hash for this tracker.
         /**
          * The element for which pointer events are being monitored.
          * @member {Element} element
@@ -277,13 +277,6 @@
             sentDragEvent:         false
         };
 
-        this.hasGestureHandlers = !!( this.pressHandler || this.nonPrimaryPressHandler ||
-                                this.releaseHandler || this.nonPrimaryReleaseHandler ||
-                                this.clickHandler || this.dblClickHandler ||
-                                this.dragHandler || this.dragEndHandler ||
-                                this.pinchHandler );
-        this.hasScrollHandler = !!this.scrollHandler;
-
         if ( $.MouseTracker.havePointerEvents ) {
             $.setElementPointerEvents( this.element, 'auto' );
         }
@@ -357,7 +350,7 @@
         getActivePointersListByType: function ( type ) {
             var delegate = THIS[ this.hash ],
                 i,
-                len = delegate.activePointersLists.length,
+                len = delegate ? delegate.activePointersLists.length : 0,
                 list;
 
             for ( i = 0; i < len; i++ ) {
@@ -367,7 +360,9 @@
             }
 
             list = new $.MouseTracker.GesturePointList( type );
-            delegate.activePointersLists.push( list );
+            if(delegate){
+                delegate.activePointersLists.push( list );
+            }
             return list;
         },
 
@@ -387,6 +382,30 @@
             }
 
             return count;
+        },
+
+        /**
+         * Do we currently have any assigned gesture handlers.
+         * @returns {Boolean} Do we currently have any assigned gesture handlers.
+         */
+        get hasGestureHandlers() {
+            return !!(this.pressHandler ||
+                      this.nonPrimaryPressHandler ||
+                      this.releaseHandler ||
+                      this.nonPrimaryReleaseHandler ||
+                      this.clickHandler ||
+                      this.dblClickHandler ||
+                      this.dragHandler ||
+                      this.dragEndHandler ||
+                      this.pinchHandler);
+        },
+
+        /**
+         * Do we currently have a scroll handler.
+         * @returns {Boolean} Do we currently have a scroll handler.
+         */
+        get hasScrollHandler() {
+            return !!this.scrollHandler;
         },
 
         /**
@@ -1114,10 +1133,9 @@
     /**
      * Detect available mouse wheel event name.
      */
-    $.MouseTracker.wheelEventName = ( $.Browser.vendor === $.BROWSERS.IE && $.Browser.version > 8 ) ||
-                                                ( 'onwheel' in document.createElement( 'div' ) ) ? 'wheel' : // Modern browsers support 'wheel'
-                                    document.onmousewheel !== undefined ? 'mousewheel' :                     // Webkit and IE support at least 'mousewheel'
-                                    'DOMMouseScroll';                                                        // Assume old Firefox
+    $.MouseTracker.wheelEventName = ( 'onwheel' in document.createElement( 'div' ) ) ? 'wheel' : // Modern browsers support 'wheel'
+                                    document.onmousewheel !== undefined ? 'mousewheel' :         // Webkit (and unsupported IE) support at least 'mousewheel'
+                                    'DOMMouseScroll';                                            // Assume old Firefox (deprecated)
 
     /**
      * Detect browser pointer device event model(s) and build appropriate list of events to subscribe to.
@@ -1130,7 +1148,7 @@
     }
 
     if ( window.PointerEvent ) {
-        // IE11 and other W3C Pointer Event implementations (see http://www.w3.org/TR/pointerevents)
+        // W3C Pointer Event implementations (see http://www.w3.org/TR/pointerevents)
         $.MouseTracker.havePointerEvents = true;
         $.MouseTracker.subscribeEvents.push( "pointerenter", "pointerleave", "pointerover", "pointerout", "pointerdown", "pointerup", "pointermove", "pointercancel" );
         // Pointer events capture support
@@ -1669,7 +1687,6 @@
 
     /**
      * Gets a W3C Pointer Events model compatible pointer type string from a DOM pointer event.
-     * IE10 used a long integer value, but the W3C specification (and IE11+) use a string "mouse", "touch", "pen", etc.
      *
      * Note: Called for both pointer events and legacy mouse events
      *         ($.MouseTracker.havePointerEvents determines which)
@@ -1677,14 +1694,7 @@
      * @inner
      */
     function getPointerType( event ) {
-        if ( $.MouseTracker.havePointerEvents ) {
-            // Note: IE pointer events bug - sends invalid pointerType on lostpointercapture events
-            //    and possibly other events. We rely on sane, valid property values in DOM events, so for
-            //    IE, when the pointerType is missing, we'll default to 'mouse'...should be right most of the time
-            return event.pointerType || (( $.Browser.vendor === $.BROWSERS.IE ) ? 'mouse' : '');
-        } else {
-            return 'mouse';
-        }
+        return $.MouseTracker.havePointerEvents && event.pointerType ? event.pointerType : 'mouse';
     }
 
 
@@ -2070,7 +2080,7 @@
         //   y-index scrolling.
         // event.deltaMode: 0=pixel, 1=line, 2=page
         // TODO: Deltas in pixel mode should be accumulated then a scroll value computed after $.DEFAULT_SETTINGS.pixelsPerWheelLine threshold reached
-        nDelta = event.deltaY < 0 ? 1 : -1;
+        nDelta = event.deltaY ? (event.deltaY < 0 ? 1 : -1) : 0;
 
         eventInfo = {
             originalEvent: event,
@@ -2552,15 +2562,14 @@
         };
 
         // Most browsers implicitly capture touch pointer events
-        // Note no IE versions have element.hasPointerCapture() so no implicit
-        //    pointer capture possible
+        // Note no IE versions (unsupported) have element.hasPointerCapture() so
+        //    no implicit pointer capture possible
         // var implicitlyCaptured = ($.MouseTracker.havePointerEvents &&
         //                         event.target.hasPointerCapture &&
         //                         $.Browser.vendor !== $.BROWSERS.IE) ?
         //                         event.target.hasPointerCapture(event.pointerId) : false;
         var implicitlyCaptured = $.MouseTracker.havePointerEvents &&
-                                gPoint.type === 'touch' &&
-                                $.Browser.vendor !== $.BROWSERS.IE;
+                                gPoint.type === 'touch';
 
         //$.console.log('pointerdown ' + (tracker.userData ? tracker.userData.toString() : '') + ' ' + (event.target === tracker.element ? 'tracker.element' : ''));
 
@@ -3770,6 +3779,21 @@
                 userData:             tracker.userData
             } );
         }
+    }
+
+
+    /**
+     * @function
+     * @private
+     * @inner
+     */
+    function uniqueHash( ) {
+        let uniqueId = Date.now().toString(36) + Math.random().toString(36).substring(2);
+        while (uniqueId in THIS) {
+            // rehash when not unique
+            uniqueId = Date.now().toString(36) + Math.random().toString(36).substring(2);
+        }
+        return uniqueId;
     }
 
 }(OpenSeadragon));

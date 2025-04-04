@@ -1,4 +1,4 @@
-/* global $, Util */
+/* global $, QUnit, Util */
 
 (function () {
 
@@ -59,31 +59,31 @@
         },
 
         // ----------
-        equalsWithVariance: function ( value1, value2, variance ) {
-            return Math.abs( value1 - value2 ) <= variance;
+        equalsWithVariance: function (actual, expected, variance) {
+            return Math.abs(actual - expected) <= variance;
         },
 
         // ----------
-        assessNumericValue: function ( assert, value1, value2, variance, message ) {
-            assert.ok( Util.equalsWithVariance( value1, value2, variance ), message + " Expected:" + value1 + " Found: " + value2 + " Variance: " + variance );
+        assessNumericValue: function (assert, actual, expected, variance, message) {
+            assert.ok(
+                Util.equalsWithVariance(actual, expected, variance),
+                message + " Actual: " + actual + " Expected: " + expected + " Variance: " + variance
+            );
         },
 
         // ----------
-        assertPointsEquals: function (assert, pointA, pointB, precision, message) {
-            Util.assessNumericValue(assert, pointA.x, pointB.x, precision, message + " x: ");
-            Util.assessNumericValue(assert, pointA.y, pointB.y, precision, message + " y: ");
+        assertPointsEquals: function (assert, actualPoint, expectedPoint, precision, message) {
+            Util.assessNumericValue(assert, actualPoint.x, expectedPoint.x, precision, message + " x: ");
+            Util.assessNumericValue(assert, actualPoint.y, expectedPoint.y, precision, message + " y: ");
         },
 
         // ----------
-        assertRectangleEquals: function (assert, rectA, rectB, precision, message) {
-            Util.assessNumericValue(assert, rectA.x, rectB.x, precision, message + " x: ");
-            Util.assessNumericValue(assert, rectA.y, rectB.y, precision, message + " y: ");
-            Util.assessNumericValue(assert, rectA.width, rectB.width, precision,
-                message + " width: ");
-            Util.assessNumericValue(assert, rectA.height, rectB.height, precision,
-                message + " height: ");
-            Util.assessNumericValue(assert, rectA.degrees, rectB.degrees, precision,
-                message + " degrees: ");
+        assertRectangleEquals: function (assert, actualRect, expectedRect, precision, message) {
+            Util.assessNumericValue(assert, actualRect.x, expectedRect.x, precision, message + " x: ");
+            Util.assessNumericValue(assert, actualRect.y, expectedRect.y, precision, message + " y: ");
+            Util.assessNumericValue(assert, actualRect.width, expectedRect.width, precision, message + " width: ");
+            Util.assessNumericValue(assert, actualRect.height, expectedRect.height, precision, message + " height: ");
+            Util.assessNumericValue(assert, actualRect.degrees, expectedRect.degrees, precision, message + " degrees: ");
         },
 
         // ----------
@@ -146,8 +146,14 @@
             obj0[member0]();
             assert.equal(called, true, 'called through for ' + member0);
             assert.equal(errored, true, 'errored for ' + member0);
-        }
+        },
     };
+
+    // Log the name of the currently running test when it starts. Uses console.log rather than
+    // $.console.log so that the message is printed even after the $.console is diverted (see below).
+    QUnit.testStart((details) => {
+        console.log(`Starting test ${details.module}.${details.name}`);
+    });
 
     /*
     Test console log capture
@@ -174,12 +180,45 @@
             }
         };
 
+    // OSD has circular references, if a console log tries to serialize
+    // certain object, remove these references from a clone (do not delete prop
+    // on the original object).
+    // NOTE: this does not work if someone replaces the original class with
+    // a mock object! Try to mock functions only, or ensure mock objects
+    // do not hold circular references.
+    const circularOSDReferences = {
+        'Tile': 'tiledImage',
+        'CacheRecord': ['_tRef', '_tiles'],
+        'World': 'viewer',
+        'DrawerBase': ['viewer', 'viewport'],
+        'CanvasDrawer': ['viewer', 'viewport'],
+        'WebGLDrawer': ['viewer', 'viewport'],
+        'TiledImage': ['viewer', '_drawer'],
+    };
     for ( var i in testLog ) {
         if ( testLog.hasOwnProperty( i ) && testLog[i].push ) {
+            // Circular reference removal
+            const osdCircularStructureReplacer = function (key, value) {
+                for (let ClassType in circularOSDReferences) {
+                    if (value instanceof OpenSeadragon[ClassType]) {
+                        const instance = {};
+                        Object.assign(instance, value);
+
+                        let circProps = circularOSDReferences[ClassType];
+                        if (!Array.isArray(circProps)) circProps = [circProps];
+                        for (let prop of circProps) {
+                            instance[prop] = '__circular_reference__';
+                        }
+                        return instance;
+                    }
+                }
+                return value;
+            };
+
             testConsole[i] = ( function ( arr ) {
                 return function () {
                     var args = Array.prototype.slice.call( arguments, 0 ); // Coerce to true Array
-                    arr.push( JSON.stringify( args ) ); // Store as JSON to avoid tedious array-equality tests
+                    arr.push( JSON.stringify( args, osdCircularStructureReplacer ) ); // Store as JSON to avoid tedious array-equality tests
                 };
             } )( testLog[i] );
 
@@ -201,5 +240,29 @@
     };
 
     OpenSeadragon.console = testConsole;
+
+    OpenSeadragon.getBuiltInDrawersForTest = function() {
+        const drawers = [];
+        for (let property in OpenSeadragon) {
+            const drawer = OpenSeadragon[ property ],
+                proto = drawer.prototype;
+            if( proto &&
+                proto instanceof OpenSeadragon.DrawerBase &&
+                $.isFunction( proto.getType )){
+                drawers.push(proto.getType.call( drawer ));
+            }
+        }
+        return drawers;
+    };
+
+    OpenSeadragon.Viewer.prototype.waitForFinishedJobsForTest = function () {
+        let finish;
+        let int = setInterval(() => {
+            if (this.imageLoader.jobsInProgress < 1) {
+                finish();
+            }
+        }, 50);
+        return new OpenSeadragon.Promise((resolve) => finish = resolve);
+    };
 } )();
 

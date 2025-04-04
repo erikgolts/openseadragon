@@ -2,7 +2,7 @@
  * OpenSeadragon - DziTileSource
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -164,6 +164,14 @@ $.extend( $.DziTileSource.prototype, $.TileSource.prototype, /** @lends OpenSead
      */
     getTileUrl: function( level, x, y ) {
         return [ this.tilesUrl, level, '/', x, '_', y, '.', this.fileFormat, this.queryParams ].join( '' );
+    },
+
+
+    /**
+     * Equality comparator
+     */
+    equals: function(otherSource) {
+        return this.tilesUrl === otherSource.tilesUrl;
     },
 
 

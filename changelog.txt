@@ -1,14 +1,81 @@
 OPENSEADRAGON CHANGELOG
 =======================
 
-5.0.0: (in progress...)
+6.0.0: (in progress...)
 
-* BREAKING CHANGE: Dropped support for IE11 (#2300, #2361 @AndrewADev)
+* NEW BEHAVIOR: OpenSeadragon Data Pipeline Overhaul (#2407, #2643 @Aiosa)
+    * DEPRECATION: Properties on tile that manage drawer data, or store data to draw: Tile.[element|imgElement|style|context2D|getImage|getCanvasContext] and transitively Tile.getScaleForEdgeSmoothing
+    * DEPRECATION: TileSource data lifecycle handlers: system manages these automatically: TileSource.[createTileCache|destroyTileCache|getTileCacheData|getTileCacheDataAsImage|getTileCacheDataAsContext2D]
+    * Tiles data is driven by caches: tiles can have multiple caches and cache can reference multiple tiles.
+    * Data types & conversion pipeline: caches support automated conversion between types, and call optionally destructors. These are asynchronous.
+    * Data conversion reasoning: the system keeps costs of convertors and seeks the cheapest conversion to a target format (using Dijkstra).
+    * Async support: events can now await handlers. Added OpenSeadragon.Promise proxy object. This object supports also synchronous mode.
+    * Drawers define what data they are able to work with, and receive automatically data from one of the declared types.
+    * Drawers now store data only inside cache, and provide optional type convertors to move data into a format they can work with.
+    * TileSource equality operator. TileSource destructor support. TileSources now must output type of the data they download [context.finish].
+    * Zombies: data can outlive tiles, and be kept in the system to wait if they are not suddenly needed. Turned on automatically with TiledImage addition with `replace: true` and equality test success.
+    * ImagesLoadedPerFrame is boosted 10 times when system is fresh (reset / open) and then declines back to original value.
+    * CacheRecord supports 'internal cache' of 'SimpleCache' type. This cache can be used by drawers to hide complex types used for rendering. Such caches are stored internally on CacheRecord objects.
+    * CacheRecord drives asynchronous data management and ensures correct behavior through awaiting Promises.
+    * TileCache adds new methods for cache modification: renameCache, cloneCache, injectCache, replaceCache, restoreTilesThatShareOriginalCache, safeUnloadCache, unloadCacheForTile and more. Used internally within invalidation events
+    * Tiles have up to two 'originalCacheKey' and 'cacheKey' caches, which keep original data and target drawn data (if modified).
+    * Invalidation Pipeline: New event 'tile-invalidated' and requestInvalidate methods on World and TiledImage. Tiles get methods to modify data to draw, system prepares data for drawing and swaps them with the current main tile cache.
+    * New test suites for the new cache system, conversion pipeline and invalidation events.
+    * New testing/demo utilities (MockSeadragon, DrawerSwitcher for switching drawers in demos, getBuiltInDrawersForTest for testing all drawers), serialization guard in tests to remove circular references.
+    * New demos, demonstrating the new pipeline. New demos for older plugins to show how compatible new version is.
+    * Misc: updated CSS for dev server, new dev & test commands.
+* New option: loadDestinationTilesOnAnimation. With it on, during animations, OSD loads tiles in the destination region, rather than the areas passed through on the way to the destination. This new feature is on by default. (#2686, #2690 @MichaelWGibson)
+* Overlay wrapper elements now have a "openseadragon-overlay-wrapper" class. If the overlay element has an ID, the wrapper gets a variant on that ID, but if the overlay element does not have an ID, we no longer give the wrapper an ID. (#2698 @lokaesshwar)
+* The functions the viewer uses to operate the zoom in and zoom out buttons are now accessible to be called programatically (#2702 @achu1998)
+* Improved how OpenSeadragon is imported in various environments (#2644 @Aiosa)
+* Improved documentation (#2676 @bennlich)
+* Improved unit tests (#2640 @harshkg23)
+* Fixed: Transparency detection didn't always work properly (#2636 @pcram-techcyte)
+* Fixed: MouseTracker's hasGestureHandlers and hasScrollHandler values were not getting updated upon dynamically adding/removing handlers (#2649 @Seafret)
+* Fixed: Sometimes images wouldn't update when you changed their opacity (#2652 @pearcetm)
+* Fixed: Possible MouseTracker hash collision (#2657 @cff29546)
+
+5.0.1:
+
+* Improved overlay handling so it plays better with other libraries (#2582 @BeebBenjamin)
+* WebGLDrawer now supports the imageSmoothingEnabled option (#2615 @pearcetm)
+* Fixed: If you switched from WebGL drawer to canvas drawer, it didn't clean up properly (#2570 @pearcetm)
+* Fixed: TiledImage.setClip would sometimes leave tiles unloaded (#2590 @pearcetm)
+* Fixed: The WebGL drawer didn't support viewportMargins (#2600, #2606 @pearcetm)
+* Fixed: If you set viewport rotation before flip, the navigator display region would be drawn wrong (#2619 @jbakarich)
+* Fixed: In some cases, the WebGL drawer would draw the image in white (#2620 @sbarex)
+* Fixed: If the user changed the page zoom or moved the window a different monitor, the image would disappear (#2627 @pearcetm)
+
+5.0.0:
+
+* BREAKING CHANGE: Dropped support for IE11 (#2300, #2361, #2553 @AndrewADev, @msalsbery)
 * DEPRECATION: The OpenSeadragon.createCallback function is no longer recommended (#2367 @akansjain)
+* The viewer now uses WebGL when available (#2310, #2462, #2466, #2468, #2469, #2472, #2478, #2488, #2492, #2521, #2537, #2557, #2558 @pearcetm, @Aiosa, @thec0keman)
+* Added webp to supported image formats (#2455 @BeebBenjamin)
+* Added avif to supported image formats (#2544 @msalsbery)
 * Introduced maxTilesPerFrame option to allow loading more tiles simultaneously (#2387 @jetic83)
+* Now when creating a viewer or navigator, we leave its position style alone if possible (#2393 @VIRAT9358)
+* Added getter & setter for Viewport.maxZoomPixelRatio (#2506 @eug-L)
+* Overlays are now positioned properly when the viewport is flipped (#2546 @BeebBenjamin)
+* Added overlayPreserveContentDirection option to keep overlays readable when viewport is flipped (#2546 @BeebBenjamin)
 * Test improvements (#2382 @AndrewADev)
 * MouseTracker options documentation fixes (#2389 @msalsbery)
+* Improved documentation and error message for Viewport.imageToViewportZoom (#2505 @eug-L)
+* Fixed documentation typos (#2507 @frameflare)
+* Additional documentation fixes (#2563 @msalsbery)
 * Fixed: Sometimes if the viewport was flipped and the user zoomed in far enough, it would flip back (#2364 @SebDelile)
+* Fixed: Two-finger tap on a Mac trackpad would zoom you out (#2431 @cavenel)
+* Fixed: dragToPan gesture could not be disabled when flickEnabled was activated (#2464 @jonasengelmann)
+* Fixed: placeholderFillStyle didn't work properly when the image was rotated (#2469 @pearcetm)
+* Fixed: Sometimes exponential springs wouldn't ever settle (#2469 @pearcetm)
+* Fixed: The navigator wouldn't update its tracking rectangle when the navigator was resized (#2491 @pearcetm)
+* Fixed: The drawer would improperly crop when the viewport was flipped and a tiled image was rotated (#2511 @pearcetm, @eug-L)
+* Fixed: Flipped viewport caused image to be flipped again when going fullscreen or resizing (#2518 @pearcetm)
+* Fixed: Viewer ajax options (loadTilesWithAjax, ajaxHeaders, and ajaxWithCredentials) weren't being propogated to the navigator. (#2539 @eug-L)
+
+4.1.1:
+
+* Fixed: Strange behavior if IIIF sizes were not in ascending order (#2416 @lutzhelm)
 
 4.1.0:
 

@@ -2,7 +2,7 @@
  * OpenSeadragon - Control
  *
  * Copyright (C) 2009 CodePlex Foundation
- * Copyright (C) 2010-2023 OpenSeadragon contributors
+ * Copyright (C) 2010-2024 OpenSeadragon contributors
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -194,11 +194,7 @@ $.Control.prototype = {
      * @param {Number} opactiy - a value between 1 and 0 inclusively.
      */
     setOpacity: function( opacity ) {
-        if ( this.element[ $.SIGNAL ] && $.Browser.vendor === $.BROWSERS.IE ) {
-            $.setElementOpacity( this.element, opacity, true );
-        } else {
-            $.setElementOpacity( this.wrapper, opacity, true );
-        }
+        $.setElementOpacity( this.wrapper, opacity, true );
     }
 };
 
